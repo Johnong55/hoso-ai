@@ -1,0 +1,119 @@
+services:
+  # ── MySQL ──────────────────────────────────────────────────────────────────
+  db:
+    image: mysql:8.0
+    container_name: admin_ai_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: admin_procedure_ai
+      MYSQL_USER: admin_ai_user
+      MYSQL_PASSWORD: your_strong_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: admin_ai_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ChromaDB ───────────────────────────────────────────────────────────────
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: admin_ai_chroma
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ALLOW_RESET=TRUE
+
+  # ── FastAPI ────────────────────────────────────────────────────────────────
+  api:
+    build: .
+    container_name: admin_ai_api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CHROMA_HOST: chroma
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+
+  # ── Celery Worker ──────────────────────────────────────────────────────────
+  worker:
+    build: .
+    container_name: admin_ai_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CHROMA_HOST: chroma
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=4
+
+  # ── Celery Beat ────────────────────────────────────────────────────────────
+  beat:
+    build: .
+    container_name: admin_ai_beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CHROMA_HOST: chroma
+    depends_on:
+      - redis
+    volumes:
+      - ./:/app
+    command: celery -A app.worker.celery_app beat --loglevel=info
+
+volumes:
+  mysql_data:
+  redis_data:
+  chroma_data:

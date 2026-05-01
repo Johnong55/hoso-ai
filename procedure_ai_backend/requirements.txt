@@ -1,0 +1,56 @@
+# ============================================================
+# Requirements — tested on Python 3.11, 3.12, 3.13
+# ============================================================
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Database
+sqlalchemy==2.0.36
+aiomysql==0.2.0
+alembic==1.13.3
+pymysql==1.1.1
+
+# Vector DB
+chromadb==0.5.18
+
+# LLM / Embeddings
+openai==1.51.0
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+python-multipart==0.0.12
+
+# Validation / Settings — pydantic 2.9+ has Python 3.13 wheels
+pydantic[email]==2.9.2
+pydantic-settings==2.5.2
+email-validator==2.2.0
+
+# Task Queue
+celery==5.4.0
+redis==5.0.8
+
+# Crawler — lxml 5.3+ has Python 3.13 wheels
+playwright==1.47.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
+fake-useragent==1.5.1
+httpx==0.27.2
+
+# Logging
+loguru==0.7.2
+
+# Utilities
+python-dotenv==1.0.1
+tenacity==9.0.0
+cachetools==5.5.0
+pytz==2024.2
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+aiosqlite==0.20.0

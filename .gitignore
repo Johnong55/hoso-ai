@@ -1,0 +1,62 @@
+# ===== Python (Backend) =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables — KHÔNG BAO GIỜ commit
+.env
+.env.*
+!.env.example
+
+# Database & Vector store
+*.db
+*.sqlite3
+chroma_data/
+chroma_db/
+
+# Logs
+logs/
+*.log
+
+# Alembic
+# (giữ alembic/versions/ nhưng bỏ pyc)
+
+# ===== Node / Frontend (UI) =====
+node_modules/
+.next/
+out/
+dist/
+build/
+.nuxt/
+.output/
+
+# Cache
+.cache/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== Testing =====
+.pytest_cache/
+htmlcov/
+.coverage
+coverage/
