@@ -177,24 +177,12 @@ class DVCQGParser:
 
     def _get_requirements(self, soup: BeautifulSoup) -> list[dict]:
         """
-        h2 "Thành phần hồ sơ" → div.list-expand chứa nhiều div.item,
-        mỗi item có bảng với <td data-title="Tên giấy tờ">.
+        h2 "Thành phần hồ sơ" → div.list-expand chứa nhiều div.item.
+        Mỗi div.item là 1 TRƯỜNG HỢP (case_group) — lấy full text từ
+        attribute title="..." của div.title bên trong item.
 
-        HTML thực tế:
-          <div class="list-expand">
-            <div class="item active">
-              <div class="title" title="...">...</div>
-              <div class="content">
-                <table class="table table-result">
-                  <tr>
-                    <td data-title="Tên giấy tờ">...</td>
-                    <td data-title="Mẫu đơn, tờ khai">...</td>
-                    <td data-title="Số lượng">...</td>
-                  </tr>
-                </table>
-              </div>
-            </div>
-          </div>
+        Mỗi requirement dict có thêm key "case_group" để chunker
+        nhóm tất cả giấy tờ của cùng trường hợp vào 1 chunk.
         """
         requirements = []
         h2 = self._find_h2_section(soup, ["Thành phần hồ sơ", "Hồ sơ cần nộp"])
@@ -211,12 +199,23 @@ class DVCQGParser:
         items = container.find_all("div", class_="item") if container.name == "div" else [container]
 
         for item in items:
+            # ── Lấy tên nhóm (case_group) từ div.title ───────────────────────
+            # HTML: <div class="title" title="* Giấy tờ phải nộp:">...</div>
+            # Chuẩn hóa: bỏ dấu * đầu, dấu : cuối, khoảng trắng thừa
+            case_group: str | None = None
+            title_div = item.find("div", class_="title") if hasattr(item, "find") else None
+            if title_div:
+                raw = (title_div.get("title") or title_div.get_text(strip=True) or "").strip()
+                # Bỏ ký tự đặc biệt đầu/cuối: "* Giấy tờ phải nộp:" → "Giấy tờ phải nộp"
+                raw = re.sub(r'^[\*\s]+', '', raw)   # bỏ * và space đầu
+                raw = re.sub(r'[\:\s]+$', '', raw)   # bỏ : và space cuối
+                case_group = raw[:500] if raw else None
+
             tables = item.find_all("table") if hasattr(item, 'find_all') else []
             for table in tables:
                 for row in table.find_all("tr"):
                     name_td = row.find("td", attrs={"data-title": "Tên giấy tờ"})
                     if not name_td:
-                        # Fallback: lấy td đầu tiên nếu có headers khớp
                         tds = row.find_all("td")
                         if tds and tds[0].get_text(strip=True):
                             name_td = tds[0]
@@ -228,10 +227,13 @@ class DVCQGParser:
                     if not name_text or len(name_text) < 3:
                         continue
 
+                    short_name = re.split(r'[.;]\s', name_text)[0][:200].strip(" -+")
                     req: dict = {
                         "order": order,
-                        "name": name_text,
+                        "name": short_name or name_text[:200],
+                        "description": name_text,
                         "is_mandatory": True,
+                        "case_group": case_group,
                     }
 
                     qty_td = row.find("td", attrs={"data-title": "Số lượng"})
@@ -242,19 +244,16 @@ class DVCQGParser:
                     if form_td:
                         a_tags = form_td.find_all("a")
                         if a_tags:
-                            # Lấy tất cả form trong ô — mỗi link tạo 1 requirement riêng
                             first = True
                             for a_tag in a_tags:
                                 href = a_tag.get("href", "")
                                 form_url = (href if href.startswith("http") else f"https://dichvucong.gov.vn{href}") if href else None
                                 form_name = a_tag.get_text(strip=True)
                                 if first:
-                                    # Form đầu tiên gắn vào requirement hiện tại
                                     req["form_name"] = form_name
                                     req["form_url"] = form_url
                                     first = False
                                 else:
-                                    # Form thứ 2 trở đi → tạo requirement mới clone từ requirement hiện tại
                                     extra_req = dict(req)
                                     extra_req["order"] = order
                                     extra_req["form_name"] = form_name
@@ -267,7 +266,7 @@ class DVCQGParser:
                     requirements.append(req)
                     order += 1
 
-        # Nếu không tìm được qua div.item, thử tìm table trực tiếp
+        # Fallback: không có div.item → thử table trực tiếp
         if not requirements:
             table = container.find("table")
             if table:
@@ -278,6 +277,7 @@ class DVCQGParser:
                             "order": i,
                             "name": tds[0].get_text(strip=True),
                             "is_mandatory": True,
+                            "case_group": None,
                         })
 
         return requirements
@@ -330,15 +330,19 @@ class DVCQGParser:
         while i + 1 < len(parts):
             try:
                 order = int(parts[i].strip())
-                title_text = parts[i + 1].strip()
-                # Chỉ lấy câu đầu tiên nếu quá dài
-                if title_text:
-                    steps.append({"order": order, "title": title_text[:400]})
+                content = parts[i + 1].strip()
+                if content:
+                    # title = nhãn ngắn, description = nội dung đầy đủ
+                    steps.append({
+                        "order": order,
+                        "title": f"Bước {order}",
+                        "description": content,
+                    })
             except (ValueError, IndexError):
                 pass
             i += 2
 
-        # Fallback: nếu không tách được "Bước N:", thử bảng
+        # Fallback 1: thử bảng
         if not steps:
             table = container.find("table")
             if table:
@@ -357,6 +361,26 @@ class DVCQGParser:
                         if len(cells) > 3:
                             step["duration"] = cells[3].get_text(strip=True)
                         steps.append(step)
+
+        # Fallback 2: không có "Bước N:" và không có bảng
+        # → lấy toàn bộ nội dung từ div.item.active đầu tiên làm 1 step
+        if not steps and container:
+            # Lấy item.active đầu tiên (bỏ qua các item "* Lưu ý:")
+            active_item = container.find("div", class_=lambda c: c and "item" in c and "active" in c)
+            if not active_item:
+                active_item = container.find("div", class_="item")
+            if active_item:
+                content_div = active_item.find("div", class_="content")
+                if content_div:
+                    # Lấy text từng <p> để giữ cấu trúc đoạn văn
+                    paragraphs = [p.get_text(" ", strip=True) for p in content_div.find_all("p") if p.get_text(strip=True)]
+                    full_text = "\n\n".join(paragraphs) if paragraphs else content_div.get_text(" ", strip=True)
+                    if full_text.strip():
+                        steps.append({
+                            "order": 1,
+                            "title": "Trình tự thực hiện",
+                            "description": full_text.strip(),
+                        })
 
         return steps
 

@@ -13,7 +13,7 @@ alembic==1.13.3
 pymysql==1.1.1
 
 # Vector DB
-chromadb==0.5.18
+qdrant-client==1.12.1
 
 # LLM / Embeddings
 openai==1.51.0

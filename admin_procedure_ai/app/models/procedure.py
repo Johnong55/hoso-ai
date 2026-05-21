@@ -109,6 +109,9 @@ class ProcedureRequirement(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # DD: description — mô tả chi tiết (bản gốc/sao, công chứng, số lượng...)
     description: Mapped[str | None] = mapped_column(Text)
+    # Tên trường hợp hồ sơ (ví dụ: "Đăng ký tại chỗ ở thuê, mượn, ở nhờ")
+    # Dùng để group requirements khi chunking → tránh 28 chunks giống nhau
+    case_group: Mapped[str | None] = mapped_column(String(500))
     # Các field bổ sung hữu ích (không có trong DD nhưng crawler cần)
     form_name: Mapped[str | None] = mapped_column(String(300))
     form_url: Mapped[str | None] = mapped_column(Text)      # link tải biểu mẫu

@@ -2,11 +2,11 @@
 from dataclasses import dataclass
 from typing import Any
 
-import chromadb
 from loguru import logger
+from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from app.core.config import settings
-from app.rag.embedding.embedder import _get_chroma_client
+from app.rag.embedding.embedder import _get_qdrant_client
 
 
 @dataclass
@@ -19,16 +19,13 @@ class RetrievedChunk:
 
 class Retriever:
     """
-    Performs pre-filtered vector search against ChromaDB.
-    Pre-filter by metadata before vector search to reduce candidate set.
+    Performs pre-filtered vector search against Qdrant.
+    Optional metadata filters (locality, domain, chunk_type) narrow the
+    candidate set before scoring, then score_threshold trims low-quality hits.
     """
 
     def __init__(self) -> None:
-        self._chroma = _get_chroma_client()
-        self._collection = self._chroma.get_or_create_collection(
-            name=settings.CHROMA_COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
+        self._qdrant = _get_qdrant_client()
 
     def retrieve(
         self,
@@ -40,41 +37,35 @@ class Retriever:
         chunk_type: str | None = None,
     ) -> list[RetrievedChunk]:
         """
-        Query Chroma with optional metadata pre-filters.
+        Query Qdrant with optional payload pre-filters.
         Fetches top_k * 2 candidates, applies threshold, returns top_k.
         """
-        where: dict[str, Any] | None = self._build_where(locality, domain, chunk_type)
-
-        query_kwargs: dict[str, Any] = {
-            "query_embeddings": [query_embedding],
-            "n_results": min(top_k * 2, 50),
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            query_kwargs["where"] = where
+        query_filter = self._build_filter(locality, domain, chunk_type)
 
         try:
-            results = self._collection.query(**query_kwargs)
+            # qdrant-client 1.12+: .search() deprecated → dùng .query_points()
+            response = self._qdrant.query_points(
+                collection_name=settings.QDRANT_COLLECTION_NAME,
+                query=query_embedding,
+                limit=min(top_k * 2, 50),
+                score_threshold=score_threshold,
+                query_filter=query_filter,
+                with_payload=True,
+            )
+            results = response.points
         except Exception as exc:
-            logger.error(f"Retriever | Chroma query failed | error={exc}")
+            logger.error(f"Retriever | Qdrant search failed | error={exc}")
             return []
 
         chunks: list[RetrievedChunk] = []
-        ids = results["ids"][0] if results["ids"] else []
-        docs = results["documents"][0] if results["documents"] else []
-        metas = results["metadatas"][0] if results["metadatas"] else []
-        distances = results["distances"][0] if results["distances"] else []
-
-        for vec_id, doc, meta, dist in zip(ids, docs, metas, distances):
-            # Chroma cosine distance → similarity score
-            score = 1.0 - dist
-            if score < score_threshold:
-                continue
+        for hit in results:
+            payload = hit.payload or {}
+            content = payload.pop("content", "")
             chunks.append(RetrievedChunk(
-                vector_id=vec_id,
-                content=doc,
-                score=score,
-                metadata=meta,
+                vector_id=str(hit.id),
+                content=content,
+                score=hit.score,
+                metadata=payload,
             ))
 
         chunks.sort(key=lambda c: c.score, reverse=True)
@@ -85,23 +76,30 @@ class Retriever:
         )
         return result
 
-    def _build_where(
+    # ── Private ───────────────────────────────────────────────────────────────
+
+    def _build_filter(
         self,
         locality: str | None,
         domain: str | None,
         chunk_type: str | None,
-    ) -> dict[str, Any] | None:
-        conditions: list[dict[str, Any]] = []
+    ) -> Filter | None:
+        """Build a Qdrant Filter from optional metadata constraints."""
+        conditions: list[FieldCondition] = []
 
         if locality:
-            conditions.append({"locality": {"$eq": locality}})
+            conditions.append(
+                FieldCondition(key="locality", match=MatchValue(value=locality))
+            )
         if domain:
-            conditions.append({"domain": {"$eq": domain}})
+            conditions.append(
+                FieldCondition(key="domain", match=MatchValue(value=domain))
+            )
         if chunk_type:
-            conditions.append({"chunk_type": {"$eq": chunk_type}})
+            conditions.append(
+                FieldCondition(key="chunk_type", match=MatchValue(value=chunk_type))
+            )
 
         if not conditions:
             return None
-        if len(conditions) == 1:
-            return conditions[0]
-        return {"$and": conditions}
+        return Filter(must=conditions)

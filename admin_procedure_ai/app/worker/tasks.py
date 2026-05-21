@@ -8,12 +8,25 @@ from app.worker.celery_app import celery_app
 
 
 def _run_async(coro):
-    """Run an async coroutine from a sync Celery task."""
+    """
+    Run an async coroutine from a sync Celery task.
+
+    Mỗi task tạo event loop riêng. Trước khi đóng loop, dispose engine
+    để xóa sạch connection pool — tránh lỗi 'Event loop is closed' ở task kế tiếp
+    khi pool cố reuse connection từ loop cũ.
+    """
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
+        try:
+            from app.db.base import engine
+            loop.run_until_complete(engine.dispose())
+        except Exception:
+            pass
         loop.close()
+        asyncio.set_event_loop(None)
 
 
 @celery_app.task(
@@ -160,11 +173,18 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
                 select(Procedure).where(Procedure.code == code)
             )).scalar_one_or_none()
 
+            # Truncate fields có giới hạn VARCHAR — parser đôi khi ghép nhiều
+            # title (cách bằng ";") làm name dài >255 chars (VD: thủ tục hải quan)
+            raw_name = parsed.get("name") or "Không rõ"
+            safe_name = raw_name[:255]
+            safe_agency = (parsed.get("implementing_agency") or "")[:255] or None
+            safe_domain = (parsed.get("domain") or "")[:100] or None
+
             if existing:
                 procedure = existing
-                procedure.name = parsed.get("name", procedure.name)
+                procedure.name = safe_name
                 procedure.description = parsed.get("description")
-                procedure.implementing_agency = parsed.get("implementing_agency")
+                procedure.implementing_agency = safe_agency
                 procedure.processing_time = parsed.get("processing_time")
                 procedure.fee = parsed.get("fee")
                 procedure.result = parsed.get("result")
@@ -173,10 +193,10 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
             else:
                 procedure = Procedure(
                     code=code,
-                    name=parsed.get("name", "Không rõ"),
-                    domain=parsed.get("domain"),
-                    implementing_agency=parsed.get("implementing_agency"),
-                    authority=parsed.get("implementing_agency"),
+                    name=safe_name,
+                    domain=safe_domain,
+                    implementing_agency=safe_agency,
+                    authority=safe_agency,
                     processing_time=parsed.get("processing_time"),
                     fee=parsed.get("fee"),
                     result=parsed.get("result"),
@@ -207,6 +227,7 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
                     order=i,
                     form_name=req.get("form_name"),
                     form_url=req.get("form_url"),
+                    case_group=req.get("case_group"),
                 ))
 
             # ── Lưu steps mới ────────────────────────────────────────────────
@@ -214,8 +235,8 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
                 db.add(ProcedureStep(
                     procedure_id=procedure.id,
                     step_order=step.get("order", 0),
-                    title=step.get("title", "")[:255],
-                    description=step.get("description"),
+                    title=step.get("title", "")[:255],       # "Bước 1", "Bước 2"...
+                    description=step.get("description"),     # nội dung đầy đủ
                 ))
 
             # ── Change detection cho chunks ──────────────────────────────────
@@ -292,7 +313,7 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
                     domain=parsed.get("domain"),
                     authority_level=AuthorityLevel.CENTRAL.value,
                     locality=item["metadata"].get("locality"),
-                    section=item["metadata"].get("section"),
+                    section=(item["metadata"].get("section") or "")[:200],
                     step_order=item["metadata"].get("step_order"),
                     is_current=True,
                     embedding_model=settings.OPENAI_EMBEDDING_MODEL,

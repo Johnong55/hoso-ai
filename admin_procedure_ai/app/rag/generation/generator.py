@@ -2,10 +2,22 @@
 from dataclasses import dataclass
 
 from loguru import logger
-from openai import OpenAI
+from openai import OpenAI, APIStatusError
 
 from app.core.config import settings
 from app.rag.retrieval.retriever import RetrievedChunk
+
+# Fallback chain — khi model chính bị 503/429/404, tự thử model khác
+# Đã verify các model này tồn tại qua ListModels API (key user hiện tại)
+MODEL_FALLBACKS = [
+    settings.LLM_MODEL,        # Model chính từ .env
+    "gemini-2.0-flash",        # Stable, hiếm overload
+    "gemini-2.0-flash-lite",   # Lite version, gần như không overload
+    "gemini-2.5-flash-lite",   # Lite 2.5
+    "gemini-flash-latest",     # Always-latest pointer
+]
+# Dedupe giữ thứ tự
+MODEL_FALLBACKS = list(dict.fromkeys(MODEL_FALLBACKS))
 
 SYSTEM_PROMPT = """Bạn là trợ lý AI chuyên về thủ tục hành chính Việt Nam.
 
@@ -65,8 +77,7 @@ class Generator:
         context = self._build_context(chunks)
         user_message = f"[NGỮ CẢNH]\n{context}\n\n[CÂU HỎI]\n{query}"
 
-        response = self._client.chat.completions.create(
-            model=settings.LLM_MODEL,
+        response, used_model = self._call_with_fallback(
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -75,11 +86,22 @@ class Generator:
             max_tokens=settings.LLM_MAX_TOKENS,
         )
 
+        if response is None:
+            logger.warning("Generator | tất cả model fallback đều fail → trả fallback message")
+            return GenerationResult(
+                answer=FALLBACK_RESPONSE,
+                is_fallback=True,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                model=used_model or settings.LLM_MODEL,
+            )
+
         answer = response.choices[0].message.content or FALLBACK_RESPONSE
         usage = response.usage
 
         logger.info(
-            f"Generator | model={settings.LLM_MODEL} "
+            f"Generator | model={used_model} "
             f"| tokens={usage.total_tokens if usage else 0} "
             f"| chunks_used={len(chunks)}"
         )
@@ -90,7 +112,7 @@ class Generator:
             prompt_tokens=usage.prompt_tokens if usage else 0,
             completion_tokens=usage.completion_tokens if usage else 0,
             total_tokens=usage.total_tokens if usage else 0,
-            model=settings.LLM_MODEL,
+            model=used_model,
         )
 
     def rewrite_query(self, query: str, history: list[dict] | None = None) -> str:
@@ -112,14 +134,55 @@ class Generator:
             prompt += f"Lịch sử hội thoại:\n{history_text}\n\n"
         prompt += f"Câu hỏi: {query}"
 
-        response = self._client.chat.completions.create(
-            model=settings.LLM_MODEL,
+        response, _ = self._call_with_fallback(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=150,
         )
+        if response is None:
+            # Tất cả model down → dùng query gốc, không rewrite
+            return query
         rewritten = response.choices[0].message.content
         return (rewritten or query).strip()
+
+    def _call_with_fallback(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ):
+        """
+        Gọi LLM với fallback chain — khi 1 model bị 503/429/500, tự thử model kế tiếp.
+        Trả về (response, model_name_đã_dùng). Nếu tất cả fail → (None, None).
+        """
+        last_error = None
+        for model in MODEL_FALLBACKS:
+            try:
+                response = self._client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                if model != settings.LLM_MODEL:
+                    logger.warning(f"Generator | fallback success | dùng {model} thay vì {settings.LLM_MODEL}")
+                return response, model
+            except APIStatusError as exc:
+                # Retry với: 503 (overload), 429 (rate limit), 500 (internal),
+                # 404 (model bị deprecate/rename → thử model khác)
+                if exc.status_code in (404, 429, 500, 503):
+                    logger.warning(f"Generator | model {model} → {exc.status_code} | thử model kế tiếp")
+                    last_error = exc
+                    continue
+                # 400/401/403 → lỗi setting hoặc auth, retry vô nghĩa
+                raise
+            except Exception as exc:
+                last_error = exc
+                logger.warning(f"Generator | model {model} → {type(exc).__name__}: {exc} | thử model kế tiếp")
+                continue
+
+        logger.error(f"Generator | ALL fallback models failed | last_error={last_error}")
+        return None, None
 
     def _build_context(self, chunks: list[RetrievedChunk]) -> str:
         parts = []

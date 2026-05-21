@@ -59,11 +59,16 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
-    # ChromaDB
-    CHROMA_HOST: str = "localhost"
-    CHROMA_PORT: int = 8000
-    CHROMA_COLLECTION_NAME: str = "procedure_chunks"
-    CHROMA_PERSIST_DIR: str = "./chroma_data"
+    # Qdrant
+    QDRANT_COLLECTION_NAME: str = "procedure_chunks"
+    # Cloud mode: set QDRANT_URL + QDRANT_API_KEY, leave QDRANT_PERSIST_DIR empty
+    QDRANT_URL: str = ""
+    QDRANT_API_KEY: str = ""
+    # Local/embedded mode: set QDRANT_PERSIST_DIR to a folder path
+    QDRANT_PERSIST_DIR: str = ""
+    # Self-hosted Docker fallback
+    QDRANT_HOST: str = "localhost"
+    QDRANT_PORT: int = 6333
 
     # ── LLM (Chat) — OpenRouter ───────────────────────────────────────────────
     LLM_API_KEY: str = ""
