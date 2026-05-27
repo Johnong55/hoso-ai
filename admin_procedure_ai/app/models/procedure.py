@@ -88,6 +88,12 @@ class Procedure(Base):
         order_by="ProcedureStep.step_order",
         lazy="noload",
     )
+    fees: Mapped[list["ProcedureFee"]] = relationship(
+        back_populates="procedure",
+        cascade="all, delete-orphan",
+        order_by="ProcedureFee.order",
+        lazy="noload",
+    )
     localities: Mapped[list["ProcedureLocality"]] = relationship(
         back_populates="procedure", cascade="all, delete-orphan", lazy="noload"
     )
@@ -138,6 +144,33 @@ class ProcedureStep(Base):
     duration: Mapped[str | None] = mapped_column(String(100))
 
     procedure: Mapped["Procedure"] = relationship(back_populates="steps", lazy="noload")
+
+
+class ProcedureFee(Base):
+    """
+    Phí/lệ phí của thủ tục theo từng phương thức nộp hồ sơ.
+    Một procedure thường có nhiều tier:
+      - Trực tiếp / Trực tuyến / Dịch vụ bưu chính
+      - Mỗi phương thức lại có nhiều mức (vd: 0đ, 5tr, 10tr tuỳ trường hợp)
+    """
+    __tablename__ = "procedure_fees"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    procedure_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("procedures.id"), nullable=False, index=True
+    )
+
+    # "Trực tiếp" | "Trực tuyến" | "Dịch vụ bưu chính" | ...
+    submission_method: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # "30 Ngày" | "07 Ngày làm việc" | ...
+    processing_time: Mapped[str | None] = mapped_column(String(200))
+    # "5 triệu Đồng" | "0 Đồng" | "Miễn phí"
+    amount_text: Mapped[str | None] = mapped_column(String(300))
+    # Mô tả trường hợp áp dụng mức phí này
+    description: Mapped[str | None] = mapped_column(Text)
+    order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    procedure: Mapped["Procedure"] = relationship(back_populates="fees", lazy="noload")
 
 
 class Locality(Base):

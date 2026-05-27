@@ -20,9 +20,9 @@
 │                                                   │                     │
 │                                                   ▼                     │
 │                              ┌──────────────────────────┐               │
-│                              │  Cohere Embed API        │               │
-│                              │  multilingual-v3 (1024d) │               │
-│                              │  input_type=search_document │            │
+│                              │  Gemini Embed API        │               │
+│                              │  gemini-embedding-001 (3072d) │           │
+│                              │  task_type=RETRIEVAL_DOCUMENT │            │
 │                              └──────────────────────────┘               │
 │                                                   │                     │
 │                                                   ▼                     │
@@ -45,7 +45,7 @@
 │        │                                                                │
 │        ▼                                                                │
 │   ┌──────────────────┐                                                  │
-│   │ Cohere Embed     │  input_type=search_query                         │
+│   │ Gemini Embed     │  task_type=RETRIEVAL_QUERY                       │
 │   └──────────────────┘                                                  │
 │        │                                                                │
 │        ▼                                                                │
@@ -102,7 +102,7 @@ Một thủ tục được tách thành **nhiều chunks**, mỗi chunk = 1 đơ
 ```
 
 **Field bắt buộc nhớ:**
-- `content` — text gốc đã embed (Cohere thấy gì → đây là cái đó)
+- `content` — text gốc đã embed (Gemini thấy gì → đây là cái đó)
 - `chunk_type` — KEY filter chính khi query
 - `procedure_code` — định danh thủ tục, dùng để dedupe
 - `case_group` — tách các "trường hợp" của cùng 1 thủ tục (vd: thuê nhà vs nhà sở hữu)
@@ -128,17 +128,17 @@ Một thủ tục được tách thành **nhiều chunks**, mỗi chunk = 1 đơ
 
 ## 3. Query Best Practices — Đọc kỹ trước khi search
 
-### 3.1 Luôn embed query với `input_type="search_query"`
+### 3.1 Luôn embed query với `task_type="RETRIEVAL_QUERY"`
 
 ```python
 # ✅ ĐÚNG
 query_vec = embedder.embed_query("tôi cần giấy tờ gì để đăng ký thường trú?")
 
-# ❌ SAI — dùng input_type=search_document sẽ giảm chất lượng 5-10%
-client.embed(texts=[q], input_type="search_document", ...)
+# ❌ SAI — dùng task_type=RETRIEVAL_DOCUMENT sẽ giảm chất lượng retrieval
+client.models.embed_content(contents=[q], config=EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT", ...))
 ```
 
-Cohere multilingual-v3 train 2 chiều riêng cho document và query. Asymmetric retrieval **bắt buộc** dùng đúng `input_type`.
+Gemini embedding train asymmetric — chiều riêng cho document và query. Asymmetric retrieval **bắt buộc** dùng đúng `task_type`. `Embedder.embed_query()` / `embed_chunks()` đã set sẵn — chỉ cần lưu ý nếu gọi API thủ công.
 
 ### 3.2 Pre-filter trước khi vector search
 
@@ -185,8 +185,8 @@ Nếu retrieval sai, **log `rewritten_query`** trước — thường lỗi ở 
 | `RAG_MAX_CONTEXT_CHUNKS` | 8 | Max chunks gửi cho LLM (cap để tránh overflow context) |
 | `RAG_CHUNK_SIZE` | 512 | Kích thước sliding window cho text dài |
 | `RAG_CHUNK_OVERLAP` | 64 | Overlap giữa 2 chunks liền kề |
-| `EMBEDDING_MODEL` | `embed-multilingual-v3.0` | Cohere model |
-| `EMBEDDING_DIMENSIONS` | 1024 | Vector dim — phải khớp với collection schema |
+| `EMBEDDING_MODEL` | `gemini-embedding-001` | Gemini model |
+| `EMBEDDING_DIMENSIONS` | 3072 | Vector dim — phải khớp với collection schema (MRL: 768/1536/3072) |
 | `QDRANT_COLLECTION_NAME` | `procedure_chunks` | Collection name |
 
 **⚠ Đổi `EMBEDDING_DIMENSIONS` = drop collection và re-index toàn bộ.**
@@ -202,7 +202,7 @@ Checklist theo thứ tự:
 2. Collection có > 0 points không?
 3. `chunk_type` filter có khớp không? (case-sensitive: `"FEE"` ≠ `"fee"`)
 4. `score_threshold` có quá cao không? → thử bỏ threshold
-5. `query` và `chunks` có cùng ngôn ngữ không? (multilingual-v3 OK Vietnamese ↔ English nhưng đồng ngôn ngữ luôn tốt hơn)
+5. `query` và `chunks` có cùng ngôn ngữ không? (gemini-embedding-001 đa ngôn ngữ tốt nhưng đồng ngôn ngữ luôn tối ưu hơn)
 
 ### 5.2 "Cùng 1 thủ tục bị trả về nhiều chunk giống nhau"
 
@@ -300,7 +300,7 @@ app/rag/
 ├── chunking/
 │   └── strategy.py             ← ProcedureChunker — semantic chunking rules
 ├── embedding/
-│   └── embedder.py             ← Cohere + Qdrant client (singleton)
+│   └── embedder.py             ← Gemini + Qdrant client (singleton)
 ├── retrieval/
 │   └── retriever.py            ← Qdrant search + payload pre-filter
 └── generation/

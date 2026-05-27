@@ -1,6 +1,21 @@
 # app/worker/tasks.py
+"""
+Celery tasks cho crawl + embed thủ tục hành chính.
+
+Flow mới (xlsx-based):
+  DocumentSource.source_url quy định phạm vi crawl:
+    - "" hoặc "all"  → tất cả file .xlsx trong settings.XLSX_DATA_DIR
+    - "<tên>.xlsx"   → chỉ file đó (path tương đối trong XLSX_DATA_DIR)
+
+  Pipeline mỗi task run:
+    1. Đọc xlsx → list mã TTHC (cột "Mã TTHC")
+    2. Với mỗi mã: rest.jsp lookup idTTHC → tải .docx → parse
+    3. Upsert vào DB (Procedure + Fees + Requirements + Steps)
+    4. Chunking + embed sang Qdrant
+"""
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 from loguru import logger
 
@@ -37,9 +52,7 @@ def _run_async(coro):
 )
 def crawl_and_embed_procedure(self, source_id: str) -> dict:
     """
-    Crawl một DocumentSource:
-    - Nếu source_url là trang chủ/nhóm → discover toàn bộ procedure URLs rồi crawl từng cái
-    - Nếu source_url là trang chi tiết 1 thủ tục → crawl trực tiếp
+    Crawl danh sách mã TTHC từ xlsx → tải docx → parse → embed.
     """
     return _run_async(_crawl_and_embed_async(self, source_id))
 
@@ -50,7 +63,11 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
     from app.core.config import settings
     from app.db.base import AsyncSessionLocal
     from app.models.document import CrawlStatus, ProcessingStatus, DocumentSource
-    from app.crawler.sources.dvcqg import DVCQGCrawler
+    from app.crawler.sources.dvcqg_xlsx import (
+        collect_all_codes,
+        read_codes_from_xlsx,
+        fetch_procedures,
+    )
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(DocumentSource).where(DocumentSource.id == source_id))
@@ -64,58 +81,49 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
         await db.commit()
 
         try:
-            crawler = DVCQGCrawler()
-            source_url = source.source_url
+            # ── Xác định danh sách mã TTHC cần crawl ──────────────────────────
+            scope = (source.source_url or "").strip().lower()
+            data_dir = Path(settings.XLSX_DATA_DIR)
 
-            # ── Xác định luồng crawl ──────────────────────────────────────────
-            # Nếu URL là trang chủ hoặc trang nhóm → discover all procedures trước
-            is_homepage = (
-                "dvc-trang-chu" in source_url
-                or "dvc-chi-tiet-nhom" in source_url
-                or source_url.rstrip("/").endswith("dvc-trang-chu.html")
-            )
-
-            if is_homepage:
-                logger.info(f"Task | crawl | homepage mode | discovering procedure URLs from {source_url}")
-                procedure_urls = await crawler.discover_all_procedure_urls()
-                logger.info(f"Task | crawl | discovered {len(procedure_urls)} procedure URLs")
+            if scope in ("", "all"):
+                code_metas = collect_all_codes(data_dir)
+                logger.info(
+                    f"Task | xlsx scope=ALL | dir={data_dir} | codes={len(code_metas)}"
+                )
             else:
-                # Crawl trực tiếp 1 thủ tục
-                procedure_urls = [source_url]
+                xlsx_path = data_dir / source.source_url
+                if not xlsx_path.exists():
+                    raise FileNotFoundError(f"xlsx file not found: {xlsx_path}")
+                code_metas = read_codes_from_xlsx(xlsx_path)
+                for m in code_metas:
+                    m["source_xlsx"] = xlsx_path.name
+                logger.info(
+                    f"Task | xlsx scope=FILE | file={xlsx_path.name} | codes={len(code_metas)}"
+                )
 
-            if not procedure_urls:
-                raise ValueError(f"Không tìm thấy procedure URL nào từ {source_url}")
+            if not code_metas:
+                raise ValueError(f"Không có mã TTHC nào từ scope='{scope or 'all'}'")
 
-            # ── Crawl + parse + chunk + embed từng thủ tục ───────────────────
-            # Batch theo nhóm 5 URL — dùng 1 browser cho cả batch, nhanh hơn nhiều
+            # ── Fetch + parse + save từng procedure ───────────────────────────
             total_chunks = 0
+            ok = 0
             failed = 0
-            batch_size = 5
+            concurrency = settings.XLSX_CRAWL_CONCURRENCY
 
-            for i in range(0, len(procedure_urls), batch_size):
-                batch_urls = procedure_urls[i: i + batch_size]
-                try:
-                    parsed_list = await crawler.fetch_procedures_batch(batch_urls)
-                except Exception as e:
-                    logger.warning(f"Task | crawl | batch fetch failed | {e}")
-                    failed += len(batch_urls)
+            async for code, parsed in fetch_procedures(code_metas, concurrency=concurrency):
+                if not parsed:
+                    failed += 1
                     continue
-
-                for proc_url, parsed_data in zip(batch_urls, parsed_list):
-                    if not parsed_data:
-                        failed += 1
-                        continue
-                    try:
-                        # Mỗi procedure dùng session riêng → commit độc lập
-                        chunks_created = await _process_parsed_procedure(
-                            source_id=source_id,
-                            proc_url=proc_url,
-                            parsed=parsed_data,
-                        )
-                        total_chunks += chunks_created
-                    except Exception as e:
-                        logger.warning(f"Task | crawl | procedure failed | url={proc_url} | {e}")
-                        failed += 1
+                try:
+                    n = await _process_parsed_procedure(
+                        source_id=source_id,
+                        parsed=parsed,
+                    )
+                    total_chunks += n
+                    ok += 1
+                except Exception as e:
+                    logger.warning(f"Task | persist failed | code={code} | {e}")
+                    failed += 1
 
             # ── Cập nhật trạng thái source ────────────────────────────────────
             source.last_crawled_at = datetime.now(timezone.utc)
@@ -126,13 +134,14 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
             logger.info(
                 f"Task | crawl | done | source_id={source_id} "
-                f"| procedures={len(procedure_urls)} | chunks={total_chunks} | failed={failed}"
+                f"| codes={len(code_metas)} | ok={ok} | failed={failed} | chunks={total_chunks}"
             )
             return {
                 "status": "success",
-                "procedures": len(procedure_urls),
-                "chunks": total_chunks,
+                "codes": len(code_metas),
+                "ok": ok,
                 "failed": failed,
+                "chunks": total_chunks,
             }
 
         except Exception as exc:
@@ -143,14 +152,14 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
             raise task.retry(exc=exc)
 
 
-async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict) -> int:
+async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
     """
-    Nhận parsed dict → chunk → embed → lưu DB + Chroma.
+    Nhận parsed dict từ dvcqg_docx_parser → upsert DB + chunk + embed.
     Dùng session riêng + commit ngay → không bị ảnh hưởng bởi procedure khác.
     Trả về số chunks đã tạo.
     """
     import hashlib
-    from sqlalchemy import select
+    from sqlalchemy import delete, select
 
     from app.core.config import settings
     from app.db.base import AsyncSessionLocal
@@ -159,7 +168,7 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
         EmbeddingStatus, ProcessingStatus,
     )
     from app.models.procedure import (
-        AuthorityLevel, Procedure, ProcedureRequirement,
+        AuthorityLevel, Procedure, ProcedureFee, ProcedureRequirement,
         ProcedureStatus, ProcedureStep,
     )
     from app.rag.chunking.strategy import ProcedureChunker
@@ -168,25 +177,32 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
     async with AsyncSessionLocal() as db:
         try:
             # ── Upsert Procedure record ───────────────────────────────────────
-            code = parsed.get("code") or parsed.get("name", "")[:50]
+            code = parsed.get("code")
+            if not code:
+                logger.warning("Task | missing code in parsed dict, skip")
+                return 0
+
             existing = (await db.execute(
                 select(Procedure).where(Procedure.code == code)
             )).scalar_one_or_none()
 
-            # Truncate fields có giới hạn VARCHAR — parser đôi khi ghép nhiều
-            # title (cách bằng ";") làm name dài >255 chars (VD: thủ tục hải quan)
+            # Truncate fields có giới hạn VARCHAR
             raw_name = parsed.get("name") or "Không rõ"
             safe_name = raw_name[:255]
             safe_agency = (parsed.get("implementing_agency") or "")[:255] or None
             safe_domain = (parsed.get("domain") or "")[:100] or None
+            fee_summary = (parsed.get("fee_summary") or "")[:500] or None
+            proc_time = (parsed.get("processing_time") or "")[:200] or None
 
             if existing:
                 procedure = existing
                 procedure.name = safe_name
+                procedure.domain = safe_domain
                 procedure.description = parsed.get("description")
                 procedure.implementing_agency = safe_agency
-                procedure.processing_time = parsed.get("processing_time")
-                procedure.fee = parsed.get("fee")
+                procedure.authority = safe_agency
+                procedure.processing_time = proc_time
+                procedure.fee = fee_summary
                 procedure.result = parsed.get("result")
                 procedure.legal_basis = parsed.get("legal_basis")
                 procedure.status = ProcedureStatus.ACTIVE
@@ -197,8 +213,8 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
                     domain=safe_domain,
                     implementing_agency=safe_agency,
                     authority=safe_agency,
-                    processing_time=parsed.get("processing_time"),
-                    fee=parsed.get("fee"),
+                    processing_time=proc_time,
+                    fee=fee_summary,
                     result=parsed.get("result"),
                     legal_basis=parsed.get("legal_basis"),
                     authority_level=AuthorityLevel.CENTRAL,
@@ -208,40 +224,56 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
 
             await db.flush()  # lấy procedure.id
 
-            # ── Xóa requirements + steps cũ trước khi insert mới ─────────────
-            from sqlalchemy import delete
+            # ── Xóa requirements + steps + fees cũ trước khi insert mới ──────
             await db.execute(
                 delete(ProcedureRequirement).where(ProcedureRequirement.procedure_id == procedure.id)
             )
             await db.execute(
                 delete(ProcedureStep).where(ProcedureStep.procedure_id == procedure.id)
             )
+            await db.execute(
+                delete(ProcedureFee).where(ProcedureFee.procedure_id == procedure.id)
+            )
+
+            # ── Lưu fees mới ─────────────────────────────────────────────────
+            for f in parsed.get("fees", []) or []:
+                db.add(ProcedureFee(
+                    procedure_id=procedure.id,
+                    submission_method=(f.get("submission_method") or "")[:100],
+                    processing_time=(f.get("processing_time") or "")[:200] or None,
+                    amount_text=(f.get("amount_text") or "")[:300] or None,
+                    description=f.get("description"),
+                    order=f.get("order", 0),
+                ))
 
             # ── Lưu requirements mới ─────────────────────────────────────────
-            for i, req in enumerate(parsed.get("requirements", [])):
+            for i, req in enumerate(parsed.get("requirements", []) or []):
                 db.add(ProcedureRequirement(
                     procedure_id=procedure.id,
-                    name=req.get("name", "")[:255],
+                    name=(req.get("name") or "")[:255],
                     description=req.get("description"),
                     is_mandatory=req.get("is_mandatory", True),
                     order=i,
-                    form_name=req.get("form_name"),
+                    form_name=(req.get("form_name") or "")[:300] or None,
                     form_url=req.get("form_url"),
-                    case_group=req.get("case_group"),
+                    quantity=(req.get("quantity") or "")[:100] or None,
+                    case_group=(req.get("case_group") or "")[:500] or None,
                 ))
 
-            # ── Lưu steps mới ────────────────────────────────────────────────
-            for step in parsed.get("steps", []):
+            # ── Lưu step blob (1 row/procedure theo yêu cầu) ────────────────
+            steps_text = parsed.get("steps_text") or ""
+            if steps_text:
                 db.add(ProcedureStep(
                     procedure_id=procedure.id,
-                    step_order=step.get("order", 0),
-                    title=step.get("title", "")[:255],       # "Bước 1", "Bước 2"...
-                    description=step.get("description"),     # nội dung đầy đủ
+                    step_order=1,
+                    title="Trình tự thực hiện",
+                    description=steps_text,
                 ))
 
             # ── Change detection cho chunks ──────────────────────────────────
-            content_hash = parsed.get("content_hash") or hashlib.sha256(
-                str(parsed).encode()
+            content_hash = hashlib.sha256(
+                (steps_text + (parsed.get("fee_summary") or "") + str(parsed.get("requirements", "")))
+                .encode("utf-8")
             ).hexdigest()
 
             source_result = await db.execute(
@@ -249,12 +281,12 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
             )
             source = source_result.scalar_one()
 
-            # Mark old chunks as stale
+            # Mark old chunks of this procedure as stale + delete vectors
             old_chunks_result = await db.execute(
                 select(DocumentChunk).where(
                     DocumentChunk.source_id == source_id,
                     DocumentChunk.procedure_id == procedure.id,
-                    DocumentChunk.is_current == True,
+                    DocumentChunk.is_current == True,  # noqa: E712
                 )
             )
             old_chunks = old_chunks_result.scalars().all()
@@ -270,32 +302,16 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
             for c in old_chunks:
                 c.is_current = False
 
-            # ── Download + parse biểu mẫu ────────────────────────────────────
-            from app.crawler.parsers.form_parser import FormParser
-            form_parser = FormParser()
-            parsed["forms"] = []
-
-            for req in parsed.get("requirements", []):
-                form_url = req.get("form_url")
-                if not form_url:
-                    continue
-                form_data = await form_parser.parse_form(
-                    form_url=form_url,
-                    form_name=req.get("form_name") or req.get("name", ""),
-                )
-                if form_data:
-                    parsed["forms"].append(form_data)
-                    logger.info(
-                        f"Task | form parsed | name={form_data['form_name']} "
-                        f"| fields={len(form_data.get('fields', []))}"
-                    )
-
             # ── Chunk + embed ─────────────────────────────────────────────────
+            # Inject id để chunking ghi vào payload Qdrant (cho debug/filter)
+            parsed["id"] = procedure.id
+            parsed["authority_level"] = AuthorityLevel.CENTRAL.value
+
             chunker = ProcedureChunker()
             chunks = chunker.chunk_procedure(parsed)
 
             if not chunks:
-                logger.warning(f"Task | no chunks generated | url={proc_url}")
+                logger.warning(f"Task | no chunks generated | code={code}")
                 await db.commit()
                 return 0
 
@@ -310,13 +326,13 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
                     chunk_index=idx,
                     chunk_type=item.get("chunk_type", ChunkType.GENERAL),
                     procedure_code=code,
-                    domain=parsed.get("domain"),
+                    domain=safe_domain,
                     authority_level=AuthorityLevel.CENTRAL.value,
                     locality=item["metadata"].get("locality"),
                     section=(item["metadata"].get("section") or "")[:200],
                     step_order=item["metadata"].get("step_order"),
                     is_current=True,
-                    embedding_model=settings.OPENAI_EMBEDDING_MODEL,
+                    embedding_model=settings.EMBEDDING_MODEL,
                     embedding_status=EmbeddingStatus.DONE,
                 ))
 
@@ -326,7 +342,7 @@ async def _process_parsed_procedure(source_id: str, proc_url: str, parsed: dict)
             # ── Commit ngay cho procedure này ────────────────────────────────
             await db.commit()
 
-            logger.info(f"Task | procedure done | code={code} | chunks={len(embedded)} | url={proc_url}")
+            logger.info(f"Task | procedure done | code={code} | chunks={len(embedded)}")
             return len(embedded)
 
         except Exception as exc:
@@ -348,7 +364,7 @@ async def _scheduled_crawl_async() -> dict:
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(DocumentSource).where(DocumentSource.is_active == True)
+            select(DocumentSource).where(DocumentSource.is_active == True)  # noqa: E712
         )
         sources = result.scalars().all()
 

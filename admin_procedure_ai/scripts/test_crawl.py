@@ -1,107 +1,85 @@
 # scripts/test_crawl.py
 """
-Chạy thử crawler để kiểm tra trước khi deploy.
+Chạy thử crawler xlsx-based để kiểm tra trước khi deploy.
+
 Usage:
-    python scripts/test_crawl.py
+    python -m scripts.test_crawl                       # test 1 mã cụ thể (1.015028)
+    python -m scripts.test_crawl --code 1.000123       # test mã khác
+    python -m scripts.test_crawl --list-codes          # liệt kê mã từ folder xlsx
 """
+import argparse
 import asyncio
 import json
 import sys
-import os
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.crawler.sources.dvcqg import DVCQGCrawler
+import httpx
+from loguru import logger
 
-
-async def test_single_procedure():
-    """Test parse 1 thủ tục cụ thể."""
-    url = "https://dichvucong.gov.vn/p/home/dvc-chi-tiet-thu-tuc-hanh-chinh.html?ma_thu_tuc=1.001193"
-    print(f"\n{'='*60}")
-    print(f"Test fetch: {url}")
-    print('='*60)
-
-    crawler = DVCQGCrawler()
-    result = await crawler.fetch_procedure(url)
-
-    if result:
-        print(f"✅ Tên:              {result.get('name')}")
-        print(f"   Mã:               {result.get('code')}")
-        print(f"   Lĩnh vực:         {result.get('domain')}")
-        print(f"   Cấp:              {result.get('authority_level')}")
-        print(f"   Cơ quan:          {result.get('implementing_agency')}")
-        print(f"   Thời gian:        {result.get('processing_time')}")
-        print(f"   Lệ phí:           {result.get('fee')}")
-        print(f"   Hồ sơ:            {len(result.get('requirements', []))} loại giấy tờ")
-        print(f"   Bước thực hiện:   {len(result.get('steps', []))} bước")
-        print(f"   Hash:             {result.get('content_hash', '')[:16]}...")
-        print(f"\n   Hồ sơ chi tiết:")
-        for r in result.get("requirements", [])[:3]:
-            print(f"     - [{r.get('order')}] {r.get('name')}")
-        print(f"\n   Các bước:")
-        for s in result.get("steps", [])[:3]:
-            print(f"     - Bước {s.get('order')}: {s.get('title')}")
-    else:
-        print("❌ Không parse được — xem log phía trên")
+from app.core.config import settings
+from app.crawler.sources.dvcqg_xlsx import (
+    collect_all_codes,
+    fetch_and_parse_procedure,
+)
 
 
-async def test_discover_groups():
-    """Test lấy danh sách group URLs từ trang chủ."""
-    print(f"\n{'='*60}")
-    print("Test discover group URLs từ trang chủ công dân")
-    print('='*60)
+async def test_single_code(code: str) -> None:
+    print(f"\n{'='*60}\nTest fetch: code={code}\n{'='*60}")
 
-    from app.crawler.sources.dvcqg import DVCQGCrawler, CITIZEN_HOME
-    from playwright.async_api import async_playwright
+    async with httpx.AsyncClient() as client:
+        parsed = await fetch_and_parse_procedure(client, code)
 
-    crawler = DVCQGCrawler()
-    async with async_playwright() as p:
-        browser = await crawler._launch(p)
-        group_urls = await crawler._get_group_urls(browser, CITIZEN_HOME)
-        await browser.close()
+    if not parsed:
+        print("❌ Không lấy được dữ liệu")
+        return
 
-    print(f"✅ Tìm thấy {len(group_urls)} nhóm:")
-    for url in group_urls:
-        group_id = url.split("group=")[-1]
-        print(f"   group={group_id} → {url}")
+    print(f"✅ idTTHC:              {parsed.get('id_tthc')}")
+    print(f"   Tên:                 {(parsed.get('name') or '')[:120]}")
+    print(f"   Mã:                  {parsed.get('code')}")
+    print(f"   Lĩnh vực:            {parsed.get('domain')}")
+    print(f"   Cấp:                 {parsed.get('authority_level_text')}")
+    print(f"   Cơ quan thực hiện:   {parsed.get('implementing_agency')}")
+    print(f"   Kết quả:             {(parsed.get('result') or '')[:100]}")
+    print(f"   Phí summary:         {parsed.get('fee_summary')}")
+    print(f"   Thời hạn:            {parsed.get('processing_time')}")
+    print(f"   Fees:                {len(parsed.get('fees', []))} mức")
+    print(f"   Requirements:        {len(parsed.get('requirements', []))} giấy tờ")
+    print(f"   Legal basis:         {len(parsed.get('legal_basis_items', []))} văn bản")
+    print(f"   Steps_text:          {len(parsed.get('steps_text') or '')} chars")
+
+    print(f"\n   --- 3 fees đầu ---")
+    for f in parsed.get("fees", [])[:3]:
+        print(f"     [{f['submission_method']}] {f.get('amount_text')} — {(f.get('description') or '')[:80]}")
+
+    print(f"\n   --- 3 requirements đầu ---")
+    for r in parsed.get("requirements", [])[:3]:
+        print(f"     • {r.get('name')[:100]}")
+        print(f"       case_group: {(r.get('case_group') or '')[:80]}")
+        print(f"       form: {r.get('form_name')} | qty: {r.get('quantity')}")
 
 
-async def test_discover_procedures_in_group():
-    """Test lấy procedure URLs trong nhóm 'Có con nhỏ' (group=750)."""
-    group_url = "https://dichvucong.gov.vn/p/home/dvc-chi-tiet-nhom-su-kien-cho-cong-dan.html?group=750"
-    print(f"\n{'='*60}")
-    print(f"Test discover procedures trong group=750 (Có con nhỏ)")
-    print('='*60)
+def list_codes() -> None:
+    metas = collect_all_codes()
+    print(f"Total: {len(metas)} codes from {settings.XLSX_DATA_DIR}\n")
+    for m in metas[:30]:
+        print(f"  {m['code']:<14} {(m.get('name_xlsx') or '')[:90]:<90} [{m.get('source_xlsx')}]")
+    if len(metas) > 30:
+        print(f"  ... và {len(metas)-30} mã khác")
 
-    from playwright.async_api import async_playwright
-    crawler = DVCQGCrawler()
 
-    async with async_playwright() as p:
-        browser = await crawler._launch(p)
-        urls = await crawler._get_procedure_urls_from_group(browser, group_url)
-        await browser.close()
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--code", default="1.015028", help="Mã TTHC cần test")
+    p.add_argument("--list-codes", action="store_true", help="Liệt kê mã từ xlsx folder")
+    args = p.parse_args()
 
-    print(f"✅ Tìm thấy {len(urls)} thủ tục:")
-    for url in urls[:10]:
-        ma = url.split("ma_thu_tuc=")[-1]
-        print(f"   ma_thu_tuc={ma}")
-    if len(urls) > 10:
-        print(f"   ... và {len(urls) - 10} thủ tục khác")
+    if args.list_codes:
+        list_codes()
+        return
+    asyncio.run(test_single_code(args.code))
 
 
 if __name__ == "__main__":
-    print("Chọn test:")
-    print("  1 - Parse 1 thủ tục (đăng ký khai sinh)")
-    print("  2 - Lấy danh sách nhóm từ trang chủ")
-    print("  3 - Lấy thủ tục trong nhóm 'Có con nhỏ'")
-
-    choice = input("Nhập số (1/2/3): ").strip()
-
-    if choice == "1":
-        asyncio.run(test_single_procedure())
-    elif choice == "2":
-        asyncio.run(test_discover_groups())
-    elif choice == "3":
-        asyncio.run(test_discover_procedures_in_group())
-    else:
-        asyncio.run(test_single_procedure())
+    main()

@@ -31,11 +31,15 @@ class ProcedureChunker:
 
     def chunk_procedure(self, procedure_data: dict[str, Any]) -> list[Chunk]:
         """
-        procedure_data keys expected:
+        procedure_data keys expected (sau khi parser docx mới):
           id, code, name, domain, authority_level, locality,
-          description, legal_basis, fee, result, processing_time,
-          requirements: [{name, form_name, quantity, document_type, note, is_mandatory, order}]
-          steps: [{order, title, description, responsible_party, duration}]
+          description, legal_basis, result, conditions,
+          requirements: [{name, form_name, quantity, case_group}]
+          fees:  [{submission_method, processing_time, amount_text, description}]
+          steps_text: str  -- toàn bộ trình tự, chunking bằng sliding window
+          # legacy compat:
+          steps: [{order, title, description, ...}]
+          fee, processing_time: str (denormalized summary)
         """
         base_meta = {
             "procedure_id": procedure_data.get("id"),
@@ -55,8 +59,52 @@ class ProcedureChunker:
                     metadata={**base_meta, "section": "Mô tả"},
                 ))
 
-        # Fee chunk
-        if procedure_data.get("fee") or procedure_data.get("processing_time"):
+        # Conditions chunk (Yêu cầu, điều kiện thực hiện)
+        if procedure_data.get("conditions"):
+            for chunk in self._split_text(procedure_data["conditions"]):
+                chunks.append(Chunk(
+                    content=f"Thủ tục: {procedure_data['name']}\nYêu cầu, điều kiện thực hiện: {chunk}",
+                    chunk_type=ChunkType.GENERAL,
+                    metadata={**base_meta, "section": "Yêu cầu, điều kiện"},
+                ))
+
+        # Fee chunks — 1 chunk per submission_method, gom hết các tier vào trong
+        # → user hỏi "phí nộp online bao nhiêu" sẽ retrieve được chunk Trực tuyến
+        # với đầy đủ các mức 5tr/10tr/0đ kèm trường hợp áp dụng
+        fees = procedure_data.get("fees") or []
+        if fees:
+            by_method: dict[str, list[dict]] = {}
+            for f in fees:
+                key = f.get("submission_method") or "Khác"
+                by_method.setdefault(key, []).append(f)
+
+            for method, tiers in by_method.items():
+                proc_time = next((t.get("processing_time") for t in tiers if t.get("processing_time")), None)
+                lines = [
+                    f"Thủ tục: {procedure_data['name']}",
+                    f"Phương thức nộp hồ sơ: {method}",
+                ]
+                if proc_time:
+                    lines.append(f"Thời hạn giải quyết: {proc_time}")
+                lines.append("Phí, lệ phí:")
+                for t in tiers:
+                    amt = t.get("amount_text") or "—"
+                    desc = t.get("description") or ""
+                    if desc:
+                        lines.append(f"- {amt}: {desc}")
+                    else:
+                        lines.append(f"- {amt}")
+                chunks.append(Chunk(
+                    content="\n".join(lines),
+                    chunk_type=ChunkType.FEE,
+                    metadata={
+                        **base_meta,
+                        "section": "Lệ phí & thời gian",
+                        "submission_method": method[:200],
+                    },
+                ))
+        elif procedure_data.get("fee") or procedure_data.get("processing_time"):
+            # Legacy fallback: 1 chunk gộp như cũ
             fee_text = f"Thủ tục: {procedure_data['name']}\n"
             if procedure_data.get("processing_time"):
                 fee_text += f"Thời gian xử lý: {procedure_data['processing_time']}\n"
@@ -136,23 +184,35 @@ class ProcedureChunker:
                 },
             ))
 
-        # Chunk từng step — nếu description quá dài thì dùng sliding window
-        for step in procedure_data.get("steps", []):
-            desc = step.get("description") or ""
-            sub_texts = self._split_text(desc) if len(desc) > self._chunk_size else [desc]
+        # Steps — gộp thành 1 blob, sliding window nếu dài
+        # Lý do bỏ tách per-step: cách hành văn không đồng nhất giữa các procedure
+        # (có cái "Bước 1/2/3", có cái viết thành paragraph liền). Để LLM tự đọc
+        # toàn bộ trình tự trong 1-2 chunks giúp giữ ngữ cảnh tốt hơn.
+        steps_text = procedure_data.get("steps_text") or ""
+        if not steps_text and procedure_data.get("steps"):
+            # Legacy fallback: gom field description của list steps
+            parts = []
+            for s in procedure_data["steps"]:
+                title = s.get("title") or f"Bước {s.get('order','?')}"
+                desc = s.get("description") or ""
+                parts.append(f"{title}: {desc}".strip())
+            steps_text = "\n".join(parts)
+
+        if steps_text:
+            sub_texts = self._split_text(steps_text)
             for part_idx, sub_text in enumerate(sub_texts):
-                step_copy = {**step, "description": sub_text}
-                # Nếu chia thành nhiều phần, ghi rõ "(phần N/M)"
-                if len(sub_texts) > 1:
-                    step_copy["title"] = f"{step.get('title', 'Trình tự thực hiện')} (phần {part_idx + 1}/{len(sub_texts)})"
-                text = self._format_step(procedure_data["name"], step_copy)
+                suffix = f" (phần {part_idx + 1}/{len(sub_texts)})" if len(sub_texts) > 1 else ""
+                content = (
+                    f"Thủ tục: {procedure_data['name']}\n"
+                    f"Trình tự thực hiện{suffix}:\n{sub_text}"
+                )
                 chunks.append(Chunk(
-                    content=text,
+                    content=content,
                     chunk_type=ChunkType.STEP,
                     metadata={
                         **base_meta,
                         "section": "Trình tự thực hiện",
-                        "step_order": step.get("order"),
+                        "part_index": part_idx,
                     },
                 ))
 
@@ -174,7 +234,7 @@ class ProcedureChunker:
            → format: "Thành phần hồ sơ (loại giấy tờ):\n1. ..."
         2. Trường hợp cụ thể ("Đăng ký thường trú tại chỗ ở thuê mượn...", ...)
            → format: "Trường hợp: [mô tả]\nGiấy tờ cần nộp:\n1. ..."
-           Đưa mô tả trường hợp vào đầu chunk để Cohere embed ngữ nghĩa đúng.
+           Đưa mô tả trường hợp vào đầu chunk để Gemini embed ngữ nghĩa đúng.
         """
         if case_group in self.STANDARD_DOC_TYPES:
             labels = {

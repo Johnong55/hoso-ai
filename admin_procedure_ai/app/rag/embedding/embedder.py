@@ -2,7 +2,8 @@
 import uuid
 from typing import Any
 
-import cohere
+from google import genai
+from google.genai import types as genai_types
 from loguru import logger
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
@@ -23,7 +24,7 @@ from app.rag.chunking.strategy import Chunk
 # ── Singleton clients ─────────────────────────────────────────────────────────
 
 _qdrant_client: QdrantClient | None = None
-_cohere_client: cohere.Client | None = None
+_gemini_client: genai.Client | None = None
 
 
 def _get_qdrant_client() -> QdrantClient:
@@ -65,22 +66,29 @@ def _ensure_collection(client: QdrantClient) -> None:
         )
 
 
-def _get_cohere_client() -> cohere.Client:
-    global _cohere_client
-    if _cohere_client is None:
-        _cohere_client = cohere.Client(api_key=settings.COHERE_API_KEY)
-    return _cohere_client
+def _get_gemini_client() -> genai.Client:
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _gemini_client
+
+
+# Cohere input_type → Gemini task_type
+_TASK_TYPE_MAP = {
+    "search_document": "RETRIEVAL_DOCUMENT",
+    "search_query": "RETRIEVAL_QUERY",
+}
 
 
 # ── Embedder ──────────────────────────────────────────────────────────────────
 
 class Embedder:
     """
-    Embedding via Cohere (embed-multilingual-v3.0) + Qdrant vector store.
+    Embedding via Gemini (gemini-embedding-001) + Qdrant vector store.
 
-    Cohere input_type convention:
-      - "search_document"  → embed chunks before storing
-      - "search_query"     → embed user query at search time
+    Gemini task_type convention:
+      - "RETRIEVAL_DOCUMENT" → embed chunks before storing
+      - "RETRIEVAL_QUERY"    → embed user query at search time
     """
 
     def __init__(self) -> None:
@@ -129,7 +137,7 @@ class Embedder:
         ]
 
     def embed_query(self, query: str) -> list[float]:
-        """Embed a user query string (search_query input_type)."""
+        """Embed a user query string (RETRIEVAL_QUERY task_type)."""
         return self._get_embeddings([query], input_type="search_query")[0]
 
     def delete_by_source(self, source_id: str) -> None:
@@ -166,21 +174,24 @@ class Embedder:
         input_type: str = "search_document",
     ) -> list[list[float]]:
         """
-        Call Cohere Embed API.
-        Auto-batches when len(texts) > 96 (Cohere per-request limit).
+        Call Gemini Embed API.
+        Auto-batches when len(texts) > 100 (Gemini per-request limit for embed_content).
         """
-        client = _get_cohere_client()
-        batch_size = 96
+        client = _get_gemini_client()
+        task_type = _TASK_TYPE_MAP.get(input_type, "RETRIEVAL_DOCUMENT")
+        batch_size = 100
         all_embeddings: list[list[float]] = []
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i: i + batch_size]
-            response = client.embed(
-                texts=batch,
+            response = client.models.embed_content(
                 model=settings.EMBEDDING_MODEL,
-                input_type=input_type,
-                embedding_types=["float"],
+                contents=batch,
+                config=genai_types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=settings.EMBEDDING_DIMENSIONS,
+                ),
             )
-            all_embeddings.extend(response.embeddings.float)
+            all_embeddings.extend(e.values for e in response.embeddings)
 
         return all_embeddings

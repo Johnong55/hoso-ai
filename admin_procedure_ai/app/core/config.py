@@ -77,12 +77,13 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 1500
     LLM_TEMPERATURE: float = 0.1
 
-    # ── Embedding — Cohere ────────────────────────────────────────────────────
-    # Lấy API key tại: https://dashboard.cohere.com/api-keys
-    # Models: embed-multilingual-v3.0 (1024 dims) | embed-multilingual-light-v3.0 (384 dims)
-    COHERE_API_KEY: str = ""
-    EMBEDDING_MODEL: str = "embed-multilingual-v3.0"
-    EMBEDDING_DIMENSIONS: int = 1024
+    # ── Embedding — Gemini ────────────────────────────────────────────────────
+    # Lấy API key tại: https://aistudio.google.com/app/apikey
+    # Models: gemini-embedding-001 (3072 dims, MRL-truncatable to 768/1536/3072)
+    #         text-embedding-004 (768 dims, legacy)
+    GEMINI_API_KEY: str = ""
+    EMBEDDING_MODEL: str = "gemini-embedding-001"
+    EMBEDDING_DIMENSIONS: int = 3072
 
     # --- Backward compat aliases ---
     @property
@@ -125,6 +126,11 @@ class Settings(BaseSettings):
     CRAWLER_TIMEOUT: int = 30
     CRAWL_SCHEDULE_HOUR: int = 2
     CRAWL_SCHEDULE_MINUTE: int = 0
+    # Thư mục chứa các file .xlsx danh sách thủ tục (1 file/bộ-ngành)
+    # Code lấy mã TTHC từ cột "Mã TTHC" rồi gọi rest.jsp + export_word_detail_tthc.jsp.
+    XLSX_DATA_DIR: str = "./data/tthc"
+    # Concurrency cho fetch song song khi crawl theo danh sách mã
+    XLSX_CRAWL_CONCURRENCY: int = 5
 
 
 @lru_cache
