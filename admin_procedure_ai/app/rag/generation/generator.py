@@ -21,13 +21,37 @@ MODEL_FALLBACKS = list(dict.fromkeys(MODEL_FALLBACKS))
 
 SYSTEM_PROMPT = """Bạn là trợ lý AI chuyên về thủ tục hành chính Việt Nam.
 
-QUY TẮC BẮT BUỘC:
-1. CHỈ trả lời dựa trên thông tin trong [NGỮ CẢNH] được cung cấp.
-2. KHÔNG bịa đặt, suy đoán, hoặc thêm thông tin ngoài ngữ cảnh.
-3. Nếu không tìm thấy thông tin trong ngữ cảnh, trả lời: "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu. Vui lòng liên hệ cơ quan có thẩm quyền để được hỗ trợ."
-4. Luôn trích dẫn nguồn (tên thủ tục) khi trả lời.
-5. Trả lời bằng tiếng Việt, rõ ràng, dễ hiểu.
-6. Không thêm thông tin ngoài phạm vi câu hỏi.
+NHIỆM VỤ:
+Giúp công dân hiểu cần làm thủ tục gì để giải quyết tình huống cụ thể của họ.
+Người dùng thường hỏi theo TÌNH HUỐNG ĐỜI THƯỜNG ("em bé sinh ở nước ngoài muốn có
+quốc tịch VN", "tôi mất sổ hộ khẩu", "muốn mua điện cho nhà mới"), KHÔNG phải tên
+thủ tục chính xác. Bạn cần MAP tình huống đó sang thủ tục phù hợp trong [NGỮ CẢNH].
+
+QUY TẮC:
+1. CHỈ dùng thông tin trong [NGỮ CẢNH]. KHÔNG bịa đặt, không thêm kiến thức ngoài.
+2. Nếu [NGỮ CẢNH] có thủ tục PHÙ HỢP với tình huống người dùng (dù tên thủ tục
+   không khớp y nguyên với từ ngữ trong câu hỏi), HÃY DÙNG thủ tục đó để trả lời
+   một cách HỮU ÍCH:
+   - Nêu rõ TÊN ĐẦY ĐỦ của thủ tục áp dụng
+   - Giải thích vì sao thủ tục này áp dụng cho tình huống của họ
+   - Liệt kê hồ sơ / trình tự / lệ phí / cơ quan thực hiện (lấy từ ngữ cảnh)
+3. Nếu trong [NGỮ CẢNH] có NHIỀU thủ tục có thể liên quan, liệt kê 2-3 thủ tục
+   khả dĩ kèm phân biệt nhanh, rồi hỏi lại để xác nhận tình huống của họ.
+4. CHỈ trả lời "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu.
+   Vui lòng liên hệ cơ quan có thẩm quyền để được hỗ trợ." khi [NGỮ CẢNH] HOÀN
+   TOÀN không có thủ tục nào liên quan tới tình huống — đừng từ chối chỉ vì tên
+   thủ tục không khớp từng từ với câu hỏi.
+5. Luôn trích dẫn nguồn (tên thủ tục đầy đủ) cuối câu trả lời.
+6. Trả lời bằng tiếng Việt, rõ ràng, có cấu trúc bullet/đoạn ngắn dễ đọc.
+
+VÍ DỤ MAP TÌNH HUỐNG → THỦ TỤC:
+- "em bé sinh ở nước ngoài muốn có quốc tịch VN" → Thủ tục đăng ký khai sinh cho
+  trẻ em sinh ở nước ngoài và có quốc tịch Việt Nam (việc đăng ký khai sinh chính
+  là việc xác nhận quốc tịch VN cho trẻ).
+- "tôi muốn đăng ký mua điện sinh hoạt" → Cấp điện mới từ lưới điện hạ áp,
+  trường hợp "Khách hàng mua điện sinh hoạt".
+- "mất hộ chiếu khi đi nước ngoài" → các thủ tục liên quan cấp lại giấy tờ xuất
+  nhập cảnh / cấp giấy thông hành.
 """
 
 FALLBACK_RESPONSE = (
@@ -99,10 +123,18 @@ class Generator:
 
         answer = response.choices[0].message.content or FALLBACK_RESPONSE
         usage = response.usage
+        finish = response.choices[0].finish_reason
+
+        if finish == "length":
+            logger.warning(
+                f"Generator | OUTPUT TRUNCATED (finish=length) | model={used_model} "
+                f"| max_tokens={settings.LLM_MAX_TOKENS} → tăng LLM_MAX_TOKENS nếu cần"
+            )
 
         logger.info(
-            f"Generator | model={used_model} "
+            f"Generator | model={used_model} | finish={finish} "
             f"| tokens={usage.total_tokens if usage else 0} "
+            f"| completion={usage.completion_tokens if usage else 0} "
             f"| chunks_used={len(chunks)}"
         )
 
@@ -117,53 +149,94 @@ class Generator:
 
     def rewrite_query(self, query: str, history: list[dict] | None = None) -> str:
         """
-        Rewrite a user query for better retrieval, optionally using conversation history.
+        Rewrite a user query for better retrieval, dùng lịch sử hội thoại để
+        GIẢI NGHĨA THAM CHIẾU (câu follow-up thiếu chủ ngữ).
         temperature=0.0 for deterministic output.
         """
         history_text = ""
         if history:
             for msg in history[-4:]:
                 role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
-                history_text += f"{role}: {msg['content']}\n"
+                # Cắt bớt câu trả lời dài của trợ lý để prompt gọn
+                content = msg["content"]
+                if msg["role"] != "user":
+                    content = content[:400]
+                history_text += f"{role}: {content}\n"
 
         prompt = (
-            "Viết lại câu hỏi sau thành một câu tìm kiếm rõ ràng về thủ tục hành chính Việt Nam. "
-            "Chỉ trả về câu đã viết lại, không giải thích.\n\n"
+            "Bạn là bộ viết lại truy vấn cho hệ thống tìm kiếm thủ tục hành chính Việt Nam.\n"
+            "Nhiệm vụ: viết lại CÂU HỎI MỚI thành một truy vấn ĐẦY ĐỦ, ĐỘC LẬP, GIÀU TỪ KHOÁ\n"
+            "để tìm đúng thủ tục.\n\n"
+            "QUY TẮC:\n"
+            "1. CÂU HỎI MỚI là câu nối tiếp thiếu chủ ngữ (vd: \"cần hồ sơ gì\", \"mất bao lâu\",\n"
+            "   \"lệ phí bao nhiêu\", \"nộp ở đâu\") → BẮT BUỘC chèn ĐẦY ĐỦ TÊN THỦ TỤC\n"
+            "   lấy từ LỊCH SỬ HỘI THOẠI vào truy vấn.\n"
+            "2. CÂU HỎI MỚI mô tả TÌNH HUỐNG ĐỜI THƯỜNG (không chứa tên thủ tục) → viết lại\n"
+            "   thành truy vấn chứa TÊN THỦ TỤC liên quan + từ khoá pháp lý phổ thông.\n"
+            "   Ví dụ:\n"
+            "   - \"em bé sinh ở nước ngoài muốn có quốc tịch Việt Nam\"\n"
+            "     → \"thủ tục đăng ký khai sinh cho trẻ em sinh ra ở nước ngoài có quốc tịch Việt Nam\"\n"
+            "   - \"tôi mới chuyển nhà cần đăng ký gì\"\n"
+            "     → \"thủ tục đăng ký thường trú tại chỗ ở mới\"\n"
+            "   - \"mất bằng lái xe\"\n"
+            "     → \"thủ tục cấp lại giấy phép lái xe bị mất\"\n"
+            "   - \"muốn đăng ký mua điện sinh hoạt cho nhà mới\"\n"
+            "     → \"thủ tục cấp điện mới từ lưới điện hạ áp khách hàng sinh hoạt\"\n"
+            "3. Giữ nguyên tên thủ tục đầy đủ, KHÔNG rút gọn, KHÔNG bỏ bớt.\n"
+            "4. Chỉ trả về DUY NHẤT truy vấn đã viết lại, không giải thích, không dấu ngoặc.\n\n"
         )
         if history_text:
-            prompt += f"Lịch sử hội thoại:\n{history_text}\n\n"
-        prompt += f"Câu hỏi: {query}"
+            prompt += f"LỊCH SỬ HỘI THOẠI:\n{history_text}\n"
+        prompt += (
+            f"\nCÂU HỎI MỚI: {query}\n\n"
+            "Truy vấn viết lại:"
+        )
 
         response, _ = self._call_with_fallback(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=150,
+            max_tokens=200,
+            # Tắt thinking cho Gemini 2.5 — rewrite là task đơn giản, không cần
+            # reasoning. Nếu để thinking ON, token suy nghĩ ăn hết max_tokens →
+            # output bị cụt + rớt tên thủ tục (đã verify bằng test).
+            extra_body={"extra_body": {"google": {"thinking_config": {"thinking_budget": 0}}}},
         )
         if response is None:
             # Tất cả model down → dùng query gốc, không rewrite
             return query
-        rewritten = response.choices[0].message.content
-        return (rewritten or query).strip()
+        rewritten = (response.choices[0].message.content or "").strip()
+        # Một số model echo lại nhãn prompt → strip
+        for prefix in ("Truy vấn viết lại:", "Truy vấn:", "Câu hỏi viết lại:"):
+            if rewritten.startswith(prefix):
+                rewritten = rewritten[len(prefix):].strip()
+        # Bỏ ngoặc kép bao quanh nếu có
+        rewritten = rewritten.strip('"').strip()
+        return rewritten or query
 
     def _call_with_fallback(
         self,
         messages: list[dict],
         temperature: float,
         max_tokens: int,
+        extra_body: dict | None = None,
     ):
         """
         Gọi LLM với fallback chain — khi 1 model bị 503/429/500, tự thử model kế tiếp.
         Trả về (response, model_name_đã_dùng). Nếu tất cả fail → (None, None).
+        `extra_body` truyền tham số provider-specific (vd tắt thinking của Gemini 2.5).
         """
         last_error = None
         for model in MODEL_FALLBACKS:
             try:
-                response = self._client.chat.completions.create(
+                kwargs = dict(
                     model=model,
                     messages=messages,
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
+                response = self._client.chat.completions.create(**kwargs)
                 if model != settings.LLM_MODEL:
                     logger.warning(f"Generator | fallback success | dùng {model} thay vì {settings.LLM_MODEL}")
                 return response, model

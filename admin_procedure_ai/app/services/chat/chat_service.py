@@ -21,6 +21,7 @@ from app.schemas.chat import (
     AskRequest,
     AskResponse,
     CreateSessionRequest,
+    FormItem,
     MessageResponse,
     SessionHistoryResponse,
     SessionResponse,
@@ -113,9 +114,96 @@ class ChatService:
         )
         messages = result.scalars().all()
 
+        # Re-derive forms cho ASSISTANT messages từ audit chain — chỉ form của
+        # TOP procedure (cùng logic với _build_forms khi live).
+        forms_by_msg: dict[str, list[FormItem]] = {}
+        assistant_ids = [m.id for m in messages if m.role == MessageRole.ASSISTANT]
+        if assistant_ids:
+            from app.models.document import DocumentChunk
+            from app.models.procedure import Procedure, ProcedureRequirement
+
+            # Pha 1: lấy (message_id, procedure_code, best_score) cho mỗi msg
+            score_rows = (await self._db.execute(
+                select(
+                    RAGGenerationLog.message_id,
+                    DocumentChunk.procedure_code,
+                    func.max(RAGRetrieval.score).label("best_score"),
+                )
+                .join(RAGQuery, RAGGenerationLog.rag_query_id == RAGQuery.id)
+                .join(RAGRetrieval, RAGRetrieval.query_id == RAGQuery.id)
+                .join(DocumentChunk, RAGRetrieval.chunk_id == DocumentChunk.id)
+                .where(
+                    RAGGenerationLog.message_id.in_(assistant_ids),
+                    DocumentChunk.procedure_code.is_not(None),
+                )
+                .group_by(RAGGenerationLog.message_id, DocumentChunk.procedure_code)
+            )).all()
+
+            # Per-message: top procedure(s) — top + những cái sát top (≤ _FORM_TOP_SCORE_GAP)
+            top_codes_by_msg: dict[str, set[str]] = {}
+            grouped: dict[str, list[tuple[str, float]]] = {}
+            for msg_id, code, sc in score_rows:
+                grouped.setdefault(msg_id, []).append((code, float(sc)))
+            for msg_id, lst in grouped.items():
+                lst.sort(key=lambda x: -x[1])
+                top = lst[0][1]
+                picks = [c for c, sc in lst if sc >= top - self._FORM_TOP_SCORE_GAP][:2]
+                top_codes_by_msg[msg_id] = set(picks)
+
+            # Pha 2: query form rows cho UNION các (msg_id, top_codes)
+            all_top_codes = {c for s in top_codes_by_msg.values() for c in s}
+            if all_top_codes:
+                form_rows = (await self._db.execute(
+                    select(
+                        ProcedureRequirement.name,
+                        ProcedureRequirement.form_name,
+                        ProcedureRequirement.form_url,
+                        Procedure.code,
+                        Procedure.name,
+                    )
+                    .join(Procedure, ProcedureRequirement.procedure_id == Procedure.id)
+                    .where(
+                        Procedure.code.in_(all_top_codes),
+                        ProcedureRequirement.form_url.is_not(None),
+                    )
+                )).all()
+
+                # Index form theo procedure_code
+                forms_by_code: dict[str, list[FormItem]] = {}
+                for req_name, form_name, form_url, proc_code, proc_name in form_rows:
+                    bucket = forms_by_code.setdefault(proc_code, [])
+                    if any(f.url == form_url for f in bucket):
+                        continue
+                    bucket.append(FormItem(
+                        name=req_name,
+                        form_name=form_name,
+                        url=form_url,
+                        procedure_code=proc_code,
+                        procedure_name=proc_name,
+                    ))
+
+                # Assign forms vào từng message theo top codes
+                for msg_id, codes in top_codes_by_msg.items():
+                    out: list[FormItem] = []
+                    seen_url: set[str] = set()
+                    for code in codes:
+                        for f in forms_by_code.get(code, []):
+                            if f.url in seen_url:
+                                continue
+                            seen_url.add(f.url)
+                            out.append(f)
+                    if out:
+                        forms_by_msg[msg_id] = out
+
+        msg_responses: list[MessageResponse] = []
+        for m in messages:
+            resp = MessageResponse.model_validate(m)
+            resp.forms = forms_by_msg.get(m.id, [])
+            msg_responses.append(resp)
+
         return SessionHistoryResponse(
             session=SessionResponse.model_validate(session),
-            messages=[MessageResponse.model_validate(m) for m in messages],
+            messages=msg_responses,
         )
 
     async def delete_session(self, session_id: str, user: User) -> None:
@@ -130,13 +218,43 @@ class ChatService:
         payload: AskRequest,
         user: User | None,
     ) -> AskResponse:
-        # Resolve or create session
+        # ── Guest flow: KHÔNG persist gì vào DB ──────────────────────────────
+        # Tránh rác conversation_sessions + messages do truy cập ẩn danh.
+        # Multi-turn được giữ bằng cách FE gửi `history` inline từ localStorage.
+        if user is None:
+            history = [
+                {"role": t.role, "content": t.content}
+                for t in (payload.history or [])
+            ][-6:]  # cap 6 lượt gần nhất, như _load_history cho user đã login
+            result = await _pipeline.run(
+                query=payload.question,
+                locality=payload.locality,
+                domain=payload.domain,
+                conversation_history=history,
+            )
+            sources = self._build_sources(result.chunks)
+            forms = await self._build_forms(result.chunks)
+            logger.info(
+                f"Chat | ask | GUEST (no persist) | history={len(history)} "
+                f"| fallback={result.is_fallback} | latency={result.latency_ms}ms"
+            )
+            return AskResponse(
+                answer=result.answer,
+                session_id="",     # FE guest không dùng (đã có session local)
+                message_id="",
+                sources=sources,
+                forms=forms,
+                is_fallback=result.is_fallback,
+                latency_ms=result.latency_ms,
+            )
+
+        # ── Authenticated flow: persist như cũ ────────────────────────────────
         if payload.session_id:
             session = await self.get_session(payload.session_id, user)
         else:
             session = ConversationSession(
-                user_id=user.id if user else None,
-                is_guest=user is None,
+                user_id=user.id,
+                is_guest=False,
                 locality_filter=payload.locality,
                 domain_filter=payload.domain,
             )
@@ -172,24 +290,24 @@ class ChatService:
         self._db.add(assistant_msg)
         await self._db.flush()
 
-        # Persist RAG audit trail only for authenticated users
-        if user:
-            await self._persist_rag_audit(
-                user_message=user_msg,
-                assistant_message=assistant_msg,
-                result=result,
-                payload=payload,
-                session=session,
-            )
+        # Persist RAG audit trail (đã chắc chắn user is not None ở đây)
+        await self._persist_rag_audit(
+            user_message=user_msg,
+            assistant_message=assistant_msg,
+            result=result,
+            payload=payload,
+            session=session,
+        )
 
         # Auto-title session on first exchange
         if not session.title:
             session.title = payload.question[:100]
 
         sources = self._build_sources(result.chunks)
+        forms = await self._build_forms(result.chunks)
         logger.info(
-            f"Chat | ask | session_id={session.id} | user_id={user.id if user else 'guest'} "
-            f"| fallback={result.is_fallback} | latency={result.latency_ms}ms"
+            f"Chat | ask | session_id={session.id} | user_id={user.id} "
+            f"| fallback={result.is_fallback} | latency={result.latency_ms}ms | forms={len(forms)}"
         )
 
         return AskResponse(
@@ -197,11 +315,64 @@ class ChatService:
             session_id=session.id,
             message_id=assistant_msg.id,
             sources=sources,
+            forms=forms,
             is_fallback=result.is_fallback,
             latency_ms=result.latency_ms,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    # Chênh score tối đa giữa procedure thứ 2 và top để vẫn show form của nó.
+    # Tránh show form của thủ tục lạc khi retrieval nhiễu.
+    _FORM_TOP_SCORE_GAP = 0.05
+
+    async def _build_forms(self, chunks: list[RetrievedChunk]) -> list[FormItem]:
+        """
+        Lấy biểu mẫu tải về CHỈ của thủ tục chính (procedure có chunk điểm cao nhất).
+        Bao gồm procedure thứ 2 nếu score sát top (chênh ≤ _FORM_TOP_SCORE_GAP) —
+        khi LLM có thể đang phân vân giữa 2 thủ tục liên quan.
+        """
+        from app.models.procedure import Procedure, ProcedureRequirement
+
+        # Best score per procedure_code
+        best_score: dict[str, float] = {}
+        for c in chunks:
+            code = c.metadata.get("procedure_code")
+            if not code:
+                continue
+            if code not in best_score or c.score > best_score[code]:
+                best_score[code] = c.score
+        if not best_score:
+            return []
+
+        # Lọc procedure: top + những cái sát top
+        top = max(best_score.values())
+        sorted_codes = sorted(best_score.items(), key=lambda x: -x[1])
+        codes = [code for code, sc in sorted_codes if sc >= top - self._FORM_TOP_SCORE_GAP][:2]
+
+        rows = (await self._db.execute(
+            select(ProcedureRequirement, Procedure.name, Procedure.code)
+            .join(Procedure, ProcedureRequirement.procedure_id == Procedure.id)
+            .where(
+                Procedure.code.in_(codes),
+                ProcedureRequirement.form_url.is_not(None),
+            )
+        )).all()
+
+        forms: list[FormItem] = []
+        seen: set[str] = set()
+        for req, proc_name, proc_code in rows:
+            if not req.form_url or req.form_url in seen:
+                continue
+            seen.add(req.form_url)
+            forms.append(FormItem(
+                name=req.name,
+                form_name=req.form_name,
+                url=req.form_url,
+                procedure_code=proc_code,
+                procedure_name=proc_name,
+            ))
+        return forms
 
     async def _load_history(self, session_id: str, limit: int = 6) -> list[dict]:
         result = await self._db.execute(

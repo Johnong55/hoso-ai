@@ -42,6 +42,31 @@ class CrawlTriggerResponse(BaseModel):
     message: str
 
 
+# ── Crawl theo bộ/ngành (agency) hoặc theo mã thủ tục ──────────────────────────
+
+class AgencyItem(BaseModel):
+    """1 cơ quan (bộ/ngành) lấy từ API DVCQG."""
+    id: str
+    name: str
+    code: str | None = None
+
+
+class CrawlAgencyRequest(BaseModel):
+    agency_id: str = Field(..., min_length=1, max_length=50)
+    agency_name: str | None = Field(None, max_length=300)
+
+
+class CrawlProcedureRequest(BaseModel):
+    # Mã TTHC dạng "1.015028", "2.000123"
+    code: str = Field(..., pattern=r"^\d+\.\d{4,}$")
+
+
+class CrawlByCodeResponse(BaseModel):
+    task_id: str
+    code: str
+    message: str
+
+
 class RAGStatsResponse(BaseModel):
     total_procedures: int
     total_chunks: int

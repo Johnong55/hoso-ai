@@ -21,6 +21,8 @@ from loguru import logger
 from app.core.config import settings
 from app.crawler.sources.dvcqg_xlsx import (
     collect_all_codes,
+    collect_all_codes_online,
+    fetch_agency_list,
     fetch_and_parse_procedure,
 )
 
@@ -60,25 +62,51 @@ async def test_single_code(code: str) -> None:
         print(f"       form: {r.get('form_name')} | qty: {r.get('quantity')}")
 
 
-def list_codes() -> None:
+def list_codes_local() -> None:
     metas = collect_all_codes()
-    print(f"Total: {len(metas)} codes from {settings.XLSX_DATA_DIR}\n")
+    print(f"[LOCAL] Total: {len(metas)} codes from {settings.XLSX_DATA_DIR}\n")
     for m in metas[:30]:
         print(f"  {m['code']:<14} {(m.get('name_xlsx') or '')[:90]:<90} [{m.get('source_xlsx')}]")
     if len(metas) > 30:
         print(f"  ... và {len(metas)-30} mã khác")
 
 
+async def list_agencies() -> None:
+    async with httpx.AsyncClient() as client:
+        agencies = await fetch_agency_list(client)
+    print(f"Agencies ({len(agencies)}):\n")
+    for a in agencies:
+        print(f"  id={a['id']:<12} code={a['code']:<18} {a['name']}")
+
+
+async def list_codes_online(agency_id: str | None) -> None:
+    async with httpx.AsyncClient() as client:
+        metas = await collect_all_codes_online(client, agency_id=agency_id)
+    print(f"\n[ONLINE] Total: {len(metas)} codes\n")
+    for m in metas[:30]:
+        print(f"  {m['code']:<14} {(m.get('name_xlsx') or '')[:80]:<80} [{m.get('source_xlsx')}]")
+    if len(metas) > 30:
+        print(f"  ... và {len(metas)-30} mã khác")
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--code", default="1.015028", help="Mã TTHC cần test")
-    p.add_argument("--list-codes", action="store_true", help="Liệt kê mã từ xlsx folder")
+    p.add_argument("--code", default="1.015028", help="Mã TTHC cần test parse")
+    p.add_argument("--list-codes", action="store_true", help="[LOCAL] Liệt kê mã từ xlsx folder")
+    p.add_argument("--list-agencies", action="store_true", help="[ONLINE] Liệt kê cơ quan qua API")
+    p.add_argument("--list-online", nargs="?", const="", default=None,
+                   metavar="AGENCY_ID",
+                   help="[ONLINE] Liệt kê mã: bỏ trống=tất cả, hoặc truyền agency_id")
     args = p.parse_args()
 
     if args.list_codes:
-        list_codes()
-        return
-    asyncio.run(test_single_code(args.code))
+        list_codes_local()
+    elif args.list_agencies:
+        asyncio.run(list_agencies())
+    elif args.list_online is not None:
+        asyncio.run(list_codes_online(args.list_online or None))
+    else:
+        asyncio.run(test_single_code(args.code))
 
 
 if __name__ == "__main__":

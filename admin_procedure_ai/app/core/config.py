@@ -74,16 +74,50 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_MODEL: str = "qwen/qwen3-6b:free"              # model sinh câu trả lời
-    LLM_MAX_TOKENS: int = 1500
+    # Gemini 2.5 là thinking model → thinking tokens và output dùng CHUNG budget này.
+    # Để đủ chỗ cho cả thinking (~1000-1500) lẫn output dài (vài Bước thực hiện),
+    # đặt 4000 trở lên. Gemini 2.5 Flash hỗ trợ tới 8192.
+    LLM_MAX_TOKENS: int = 4000
     LLM_TEMPERATURE: float = 0.1
 
-    # ── Embedding — Gemini ────────────────────────────────────────────────────
+    # ── Embedding (provider switch) ───────────────────────────────────────────
+    # "gemini"     → Google gemini-embedding-001 (3072d), chất lượng tốt nhưng
+    #                free tier giới hạn chặt (100/phút, 1000/ngày).
+    # "cloudflare" → Cloudflare Workers AI @cf/baai/bge-m3 (1024d), đa ngôn ngữ,
+    #                free tier thoáng (~10k Neurons/ngày), ít bị 429.
+    # ⚠ Đổi provider → BẮT BUỘC reset Qdrant collection (dimensions khác nhau).
+    EMBEDDING_PROVIDER: str = "gemini"
+
+    # -- Gemini --
     # Lấy API key tại: https://aistudio.google.com/app/apikey
-    # Models: gemini-embedding-001 (3072 dims, MRL-truncatable to 768/1536/3072)
-    #         text-embedding-004 (768 dims, legacy)
     GEMINI_API_KEY: str = ""
-    EMBEDDING_MODEL: str = "gemini-embedding-001"
-    EMBEDDING_DIMENSIONS: int = 3072
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    GEMINI_EMBEDDING_DIMENSIONS: int = 3072
+    # Throttle chủ động (chỉ áp dụng cho Gemini free tier ~100 req/phút).
+    # 0.7s ≈ 85 req/phút. Đặt 0 để tắt (khi đã lên Tier 1 / dùng Cloudflare).
+    EMBEDDING_MIN_INTERVAL_SEC: float = 0.7
+    # Số lần retry khi gặp 429 (tôn trọng retryDelay từ API).
+    EMBEDDING_MAX_RETRIES: int = 6
+
+    # -- Cloudflare Workers AI --
+    # Account ID + API token tại: https://dash.cloudflare.com → AI → Workers AI
+    CLOUDFLARE_ACCOUNT_ID: str = ""
+    CLOUDFLARE_API_TOKEN: str = ""
+    CLOUDFLARE_EMBEDDING_MODEL: str = "@cf/baai/bge-m3"
+    CLOUDFLARE_EMBEDDING_DIMENSIONS: int = 1024
+
+    # -- Active model/dims (resolve theo provider) --
+    @property
+    def EMBEDDING_MODEL(self) -> str:
+        if self.EMBEDDING_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_EMBEDDING_MODEL
+        return self.GEMINI_EMBEDDING_MODEL
+
+    @property
+    def EMBEDDING_DIMENSIONS(self) -> int:
+        if self.EMBEDDING_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_EMBEDDING_DIMENSIONS
+        return self.GEMINI_EMBEDDING_DIMENSIONS
 
     # --- Backward compat aliases ---
     @property

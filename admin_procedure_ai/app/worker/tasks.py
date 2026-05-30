@@ -58,14 +58,16 @@ def crawl_and_embed_procedure(self, source_id: str) -> dict:
 
 
 async def _crawl_and_embed_async(task, source_id: str) -> dict:
+    import httpx
     from sqlalchemy import select
 
     from app.core.config import settings
     from app.db.base import AsyncSessionLocal
     from app.models.document import CrawlStatus, ProcessingStatus, DocumentSource
     from app.crawler.sources.dvcqg_xlsx import (
-        collect_all_codes,
+        collect_all_codes_online,
         read_codes_from_xlsx,
+        resolve_agency_id,
         fetch_procedures,
     )
 
@@ -82,24 +84,37 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
         try:
             # ── Xác định danh sách mã TTHC cần crawl ──────────────────────────
-            scope = (source.source_url or "").strip().lower()
-            data_dir = Path(settings.XLSX_DATA_DIR)
+            # source_url quy định phạm vi:
+            #   ""/"all"          → ONLINE, tất cả cơ quan (qua API)
+            #   "<tên CQ>"/"<id>" → ONLINE, 1 cơ quan (resolve qua API)
+            #   "<file>.xlsx"     → LOCAL, đọc file trong XLSX_DATA_DIR
+            scope = (source.source_url or "").strip()
+            scope_low = scope.lower()
 
-            if scope in ("", "all"):
-                code_metas = collect_all_codes(data_dir)
-                logger.info(
-                    f"Task | xlsx scope=ALL | dir={data_dir} | codes={len(code_metas)}"
-                )
-            else:
-                xlsx_path = data_dir / source.source_url
+            if scope_low.endswith(".xlsx"):
+                # LOCAL file mode
+                xlsx_path = Path(settings.XLSX_DATA_DIR) / scope
                 if not xlsx_path.exists():
                     raise FileNotFoundError(f"xlsx file not found: {xlsx_path}")
                 code_metas = read_codes_from_xlsx(xlsx_path)
                 for m in code_metas:
                     m["source_xlsx"] = xlsx_path.name
-                logger.info(
-                    f"Task | xlsx scope=FILE | file={xlsx_path.name} | codes={len(code_metas)}"
-                )
+                logger.info(f"Task | scope=LOCAL FILE | file={xlsx_path.name} | codes={len(code_metas)}")
+            else:
+                # ONLINE mode
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    if scope_low in ("", "all"):
+                        code_metas = await collect_all_codes_online(client)
+                        logger.info(f"Task | scope=ONLINE ALL | codes={len(code_metas)}")
+                    else:
+                        agency_id = await resolve_agency_id(client, scope)
+                        if not agency_id:
+                            raise ValueError(f"Không tìm thấy cơ quan khớp '{scope}'")
+                        code_metas = await collect_all_codes_online(client, agency_id=agency_id)
+                        logger.info(
+                            f"Task | scope=ONLINE AGENCY | '{scope}' (id={agency_id}) "
+                            f"| codes={len(code_metas)}"
+                        )
 
             if not code_metas:
                 raise ValueError(f"Không có mã TTHC nào từ scope='{scope or 'all'}'")
@@ -107,6 +122,7 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
             # ── Fetch + parse + save từng procedure ───────────────────────────
             total_chunks = 0
             ok = 0
+            skipped = 0       # procedures không đổi → không embed lại (tiết kiệm quota)
             failed = 0
             concurrency = settings.XLSX_CRAWL_CONCURRENCY
 
@@ -119,8 +135,11 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
                         source_id=source_id,
                         parsed=parsed,
                     )
-                    total_chunks += n
-                    ok += 1
+                    if n == SKIPPED_UNCHANGED:
+                        skipped += 1
+                    else:
+                        total_chunks += n
+                        ok += 1
                 except Exception as e:
                     logger.warning(f"Task | persist failed | code={code} | {e}")
                     failed += 1
@@ -134,12 +153,14 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
             logger.info(
                 f"Task | crawl | done | source_id={source_id} "
-                f"| codes={len(code_metas)} | ok={ok} | failed={failed} | chunks={total_chunks}"
+                f"| codes={len(code_metas)} | ok={ok} | skipped={skipped} "
+                f"| failed={failed} | chunks={total_chunks}"
             )
             return {
                 "status": "success",
                 "codes": len(code_metas),
                 "ok": ok,
+                "skipped": skipped,
                 "failed": failed,
                 "chunks": total_chunks,
             }
@@ -152,14 +173,69 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
             raise task.retry(exc=exc)
 
 
+SKIPPED_UNCHANGED = -1  # sentinel: procedure không đổi → skip embed
+
+
+def _compute_procedure_hash(parsed: dict) -> str:
+    """
+    SHA256 deterministic của các trường ảnh hưởng đến chunks/embed.
+    Dùng để skip re-embed khi nội dung không đổi giữa các lần crawl.
+    """
+    import hashlib
+    import json
+
+    # Chỉ lấy các field quan trọng (bỏ id, vector_id, timestamps...).
+    # Sort dict để hash deterministic bất kể thứ tự key.
+    payload = {
+        "name": parsed.get("name"),
+        "domain": parsed.get("domain"),
+        "description": parsed.get("description"),
+        "conditions": parsed.get("conditions"),
+        "result": parsed.get("result"),
+        "legal_basis": parsed.get("legal_basis"),
+        "steps_text": parsed.get("steps_text"),
+        "fees": sorted(
+            [
+                {
+                    "method": f.get("submission_method"),
+                    "time": f.get("processing_time"),
+                    "amount": f.get("amount_text"),
+                    "desc": f.get("description"),
+                }
+                for f in parsed.get("fees") or []
+            ],
+            key=lambda x: (x["method"] or "", x["amount"] or ""),
+        ),
+        "requirements": sorted(
+            [
+                {
+                    "name": r.get("name"),
+                    "case_group": r.get("case_group"),
+                    "form_name": r.get("form_name"),
+                    "form_url": r.get("form_url"),
+                    "quantity": r.get("quantity"),
+                }
+                for r in parsed.get("requirements") or []
+            ],
+            key=lambda x: (x["case_group"] or "", x["name"] or ""),
+        ),
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
     """
     Nhận parsed dict từ dvcqg_docx_parser → upsert DB + chunk + embed.
     Dùng session riêng + commit ngay → không bị ảnh hưởng bởi procedure khác.
-    Trả về số chunks đã tạo.
+
+    Trả về:
+      -1  → SKIPPED (nội dung không đổi so với lần crawl trước, không embed lại)
+       0  → procedure không có chunks (trống)
+      >0  → số chunks mới đã embed
     """
     import hashlib
-    from sqlalchemy import delete, select
+    from sqlalchemy import delete, func, select
 
     from app.core.config import settings
     from app.db.base import AsyncSessionLocal
@@ -182,9 +258,32 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                 logger.warning("Task | missing code in parsed dict, skip")
                 return 0
 
+            # Compute hash EARLY — gate cho việc skip embed
+            new_hash = _compute_procedure_hash(parsed)
+
             existing = (await db.execute(
                 select(Procedure).where(Procedure.code == code)
             )).scalar_one_or_none()
+
+            # ── EARLY EXIT: nội dung không đổi + chunks vẫn còn ──────────────
+            if existing and existing.content_hash == new_hash:
+                # Verify chunks vẫn còn (tránh trường hợp Qdrant đã bị xoá nhưng
+                # DB còn lưu hash cũ → vẫn cần re-embed)
+                chunk_count = (await db.execute(
+                    select(func.count(DocumentChunk.id)).where(
+                        DocumentChunk.procedure_id == existing.id,
+                        DocumentChunk.is_current == True,  # noqa: E712
+                    )
+                )).scalar() or 0
+                if chunk_count > 0:
+                    logger.info(
+                        f"Task | UNCHANGED, skip embed | code={code} "
+                        f"| existing_chunks={chunk_count}"
+                    )
+                    # Vẫn touch updated_at để biết lần crawl gần nhất
+                    existing.status = ProcedureStatus.ACTIVE
+                    await db.commit()
+                    return SKIPPED_UNCHANGED
 
             # Truncate fields có giới hạn VARCHAR
             raw_name = parsed.get("name") or "Không rõ"
@@ -336,6 +435,9 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                     embedding_status=EmbeddingStatus.DONE,
                 ))
 
+            # Cập nhật hash mới cho procedure → lần crawl sau sẽ compare
+            procedure.content_hash = new_hash
+
             source.content_hash = content_hash
             source.processing_status = ProcessingStatus.EMBEDDED
 
@@ -348,6 +450,70 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
         except Exception as exc:
             await db.rollback()
             raise
+
+
+# ── Crawl 1 thủ tục lẻ theo mã ─────────────────────────────────────────────────
+
+MANUAL_SOURCE_URL = "manual:single-procedures"
+
+
+async def _ensure_manual_source() -> str:
+    """Lấy (hoặc tạo) 1 DocumentSource dùng chung cho các thủ tục crawl lẻ theo mã."""
+    from sqlalchemy import select
+    from app.db.base import AsyncSessionLocal
+    from app.models.document import DocumentSource
+
+    async with AsyncSessionLocal() as db:
+        existing = (await db.execute(
+            select(DocumentSource).where(DocumentSource.source_url == MANUAL_SOURCE_URL)
+        )).scalar_one_or_none()
+        if existing:
+            return existing.id
+        source = DocumentSource(
+            title="Thủ tục lẻ (crawl theo mã)",
+            source_url=MANUAL_SOURCE_URL,
+            source_type="dvcqg_manual",
+            is_active=True,
+        )
+        db.add(source)
+        await db.flush()
+        sid = source.id
+        await db.commit()
+        return sid
+
+
+@celery_app.task(
+    name="app.worker.tasks.crawl_single_procedure",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=30,
+)
+def crawl_single_procedure(self, code: str) -> dict:
+    """Crawl + embed 1 thủ tục theo mã TTHC (vd '1.015028')."""
+    return _run_async(_crawl_single_async(self, code))
+
+
+async def _crawl_single_async(task, code: str) -> dict:
+    import httpx
+    from app.crawler.sources.dvcqg_xlsx import fetch_and_parse_procedure
+
+    source_id = await _ensure_manual_source()
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            parsed = await fetch_and_parse_procedure(client, code)
+
+        if not parsed:
+            logger.warning(f"Task | single | no data | code={code}")
+            return {"status": "not_found", "code": code}
+
+        n = await _process_parsed_procedure(source_id=source_id, parsed=parsed)
+        logger.info(f"Task | single | done | code={code} | chunks={n}")
+        return {"status": "success", "code": code, "chunks": n, "source_id": source_id}
+
+    except Exception as exc:
+        logger.error(f"Task | single | failed | code={code} | {exc}")
+        raise task.retry(exc=exc)
 
 
 @celery_app.task(name="app.worker.tasks.scheduled_crawl")

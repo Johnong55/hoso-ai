@@ -1,4 +1,7 @@
 # app/rag/embedding/embedder.py
+import re
+import threading
+import time
 import uuid
 from typing import Any
 
@@ -78,6 +81,103 @@ _TASK_TYPE_MAP = {
     "search_document": "RETRIEVAL_DOCUMENT",
     "search_query": "RETRIEVAL_QUERY",
 }
+
+
+# ── Rate limiting + 429 retry ──────────────────────────────────────────────────
+
+# Throttle chủ động: đảm bảo cách nhau tối thiểu EMBEDDING_MIN_INTERVAL_SEC giữa
+# 2 lần gọi embed (chia sẻ giữa các thread của celery --pool=solo là 1 thread,
+# nhưng vẫn an toàn nếu sau này đổi pool).
+_rate_lock = threading.Lock()
+_last_call_ts = 0.0
+
+
+def _throttle() -> None:
+    global _last_call_ts
+    min_interval = settings.EMBEDDING_MIN_INTERVAL_SEC
+    if min_interval <= 0:
+        return
+    with _rate_lock:
+        now = time.monotonic()
+        wait = _last_call_ts + min_interval - now
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_ts = time.monotonic()
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    s = str(exc)
+    return "429" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def _parse_retry_delay(exc: Exception, default: float = 30.0) -> float:
+    """Lấy số giây cần chờ từ message lỗi 429 (retryDelay hoặc 'retry in Xs')."""
+    s = str(exc)
+    m = re.search(r"retry in ([\d.]+)s", s) or re.search(r"retryDelay['\"]?:\s*['\"]?(\d+)s", s)
+    if m:
+        try:
+            return float(m.group(1)) + 1.0  # +1s đệm
+        except ValueError:
+            pass
+    return default
+
+
+# ── Cloudflare Workers AI embedding ────────────────────────────────────────────
+
+_cf_http: "httpx.Client | None" = None
+
+
+def _get_cf_client():
+    global _cf_http
+    import httpx
+    if _cf_http is None:
+        _cf_http = httpx.Client(timeout=60)
+    return _cf_http
+
+
+def _embed_cloudflare_batch(batch: list[str]) -> list[list[float]]:
+    """
+    Gọi Cloudflare Workers AI (@cf/baai/bge-m3) cho 1 batch text.
+    bge-m3 là embedding đối xứng (không phân biệt query/document) nên bỏ qua input_type.
+    Có retry khi gặp 429.
+    """
+    import httpx
+
+    if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+        raise RuntimeError(
+            "Thiếu CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN trong .env "
+            "(cần khi EMBEDDING_PROVIDER=cloudflare)"
+        )
+
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/"
+        f"{settings.CLOUDFLARE_ACCOUNT_ID}/ai/run/{settings.CLOUDFLARE_EMBEDDING_MODEL}"
+    )
+    headers = {"Authorization": f"Bearer {settings.CLOUDFLARE_API_TOKEN}"}
+    client = _get_cf_client()
+    max_retries = settings.EMBEDDING_MAX_RETRIES
+    attempt = 0
+
+    while True:
+        try:
+            resp = client.post(url, headers=headers, json={"text": batch})
+            if resp.status_code == 429:
+                raise httpx.HTTPStatusError("429", request=resp.request, response=resp)
+            resp.raise_for_status()
+            body = resp.json()
+            if not body.get("success", False):
+                raise RuntimeError(f"Cloudflare AI error: {body.get('errors')}")
+            return body["result"]["data"]
+        except Exception as exc:
+            is_429 = "429" in str(exc)
+            if not is_429 or attempt >= max_retries:
+                raise
+            attempt += 1
+            delay = _parse_retry_delay(exc, default=10.0)
+            logger.warning(
+                f"Embedder(CF) | 429 rate limit, retry {attempt}/{max_retries} after {delay:.0f}s"
+            )
+            time.sleep(delay)
 
 
 # ── Embedder ──────────────────────────────────────────────────────────────────
@@ -174,24 +274,50 @@ class Embedder:
         input_type: str = "search_document",
     ) -> list[list[float]]:
         """
-        Call Gemini Embed API.
-        Auto-batches when len(texts) > 100 (Gemini per-request limit for embed_content).
+        Embed texts qua provider đang cấu hình (settings.EMBEDDING_PROVIDER).
+        Auto-batch 100 texts/request (giới hạn chung của cả Gemini & Cloudflare).
         """
-        client = _get_gemini_client()
-        task_type = _TASK_TYPE_MAP.get(input_type, "RETRIEVAL_DOCUMENT")
+        provider = settings.EMBEDDING_PROVIDER.lower()
         batch_size = 100
         all_embeddings: list[list[float]] = []
 
+        if provider == "cloudflare":
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i: i + batch_size]
+                all_embeddings.extend(_embed_cloudflare_batch(batch))
+            return all_embeddings
+
+        # default: gemini
+        client = _get_gemini_client()
+        task_type = _TASK_TYPE_MAP.get(input_type, "RETRIEVAL_DOCUMENT")
         for i in range(0, len(texts), batch_size):
             batch = texts[i: i + batch_size]
-            response = client.models.embed_content(
-                model=settings.EMBEDDING_MODEL,
-                contents=batch,
-                config=genai_types.EmbedContentConfig(
-                    task_type=task_type,
-                    output_dimensionality=settings.EMBEDDING_DIMENSIONS,
-                ),
-            )
+            response = self._embed_batch_with_retry(client, batch, task_type)
             all_embeddings.extend(e.values for e in response.embeddings)
-
         return all_embeddings
+
+    def _embed_batch_with_retry(self, client, batch: list[str], task_type: str):
+        """Gọi embed_content với throttle + retry khi gặp 429 RESOURCE_EXHAUSTED."""
+        max_retries = settings.EMBEDDING_MAX_RETRIES
+        attempt = 0
+        while True:
+            _throttle()
+            try:
+                return client.models.embed_content(
+                    model=settings.EMBEDDING_MODEL,
+                    contents=batch,
+                    config=genai_types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=settings.EMBEDDING_DIMENSIONS,
+                    ),
+                )
+            except Exception as exc:
+                if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                    raise
+                delay = _parse_retry_delay(exc)
+                attempt += 1
+                logger.warning(
+                    f"Embedder | 429 rate limit, retry {attempt}/{max_retries} "
+                    f"after {delay:.0f}s"
+                )
+                time.sleep(delay)

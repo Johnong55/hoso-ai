@@ -64,6 +64,11 @@ class Procedure(Base):
     fee: Mapped[str | None] = mapped_column(String(500))
     result: Mapped[str | None] = mapped_column(Text)
 
+    # SHA256 hex của parsed content (steps + fees + requirements + ...)
+    # Dùng cho change detection: nếu hash giống lần crawl trước → SKIP re-embed,
+    # tiết kiệm quota embedding API.
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+
     status: Mapped[str] = mapped_column(
         Enum(ProcedureStatus, values_callable=lambda x: [e.value for e in x]),
         default=ProcedureStatus.DRAFT,
