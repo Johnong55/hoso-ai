@@ -48,11 +48,16 @@ class AgencyItem(BaseModel):
     """1 cơ quan (bộ/ngành) lấy từ API DVCQG."""
     id: str
     name: str
-    code: str | None = None
+    # `code` là `departmentCode` dùng server-side filter khi crawl (vd "G19", "D01").
+    # Luôn có giá trị từ endpoint /department/list-with-location.
+    code: str
+    level: str | None = None
 
 
 class CrawlAgencyRequest(BaseModel):
-    agency_id: str = Field(..., min_length=1, max_length=50)
+    # `agency_code` là `departmentCode` (vd "G19") — backend dùng để filter
+    # server-side. Là field bắt buộc cho flow mới.
+    agency_code: str = Field(..., min_length=1, max_length=20)
     agency_name: str | None = Field(None, max_length=300)
 
 

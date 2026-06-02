@@ -5,7 +5,7 @@ Celery tasks cho crawl + embed thủ tục hành chính.
 Flow (JSON API mới của dichvucong.gov.vn):
   DocumentSource.source_url quy định phạm vi crawl:
     - "" hoặc "all"  → toàn bộ thủ tục (paginate hết list-all-formality)
-    - "<UUID>"       → 1 bộ/ngành cụ thể (filter theo departmentPromulgateId)
+    - "<departmentCode>" (vd "G19", "D01")  → 1 bộ/ngành, filter server-side
 
   Pipeline mỗi task run:
     1. discover_all_procedures → list item (id, code, ...) từ list-all API
@@ -78,13 +78,13 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
         try:
             # source_url:
-            #   ""/"all"  → discover toàn bộ
-            #   "<UUID>"  → filter theo departmentPromulgateId (1 bộ/ngành)
+            #   ""/"all"           → discover toàn bộ
+            #   "<departmentCode>" → 1 bộ/ngành, filter server-side (vd "G19")
             scope = (source.source_url or "").strip()
             scope_low = scope.lower()
 
             import httpx
-            from app.crawler.sources.dvcqg_json import _warmup, HEADERS  # noqa: F401
+            from app.crawler.sources.dvcqg_json import _warmup
 
             async with httpx.AsyncClient(
                 http2=False, follow_redirects=True, timeout=settings.CRAWLER_TIMEOUT
@@ -95,13 +95,11 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
                     items = await discover_all_procedures(client)
                     logger.info(f"Task | scope=ALL | items={len(items)}")
                 else:
-                    # scope = departmentPromulgateId (UUID). Hiện chưa hỗ trợ
-                    # resolve theo tên — UI luôn truyền UUID.
                     items = await discover_all_procedures(
-                        client, department_promulgate_id=scope
+                        client, department_code=scope
                     )
                     logger.info(
-                        f"Task | scope=AGENCY id={scope} | items={len(items)}"
+                        f"Task | scope=AGENCY code={scope} | items={len(items)}"
                     )
 
             if not items:

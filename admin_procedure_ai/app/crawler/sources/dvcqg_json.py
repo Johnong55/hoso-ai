@@ -31,6 +31,7 @@ from app.crawler.parsers.dvcqg_json_parser import parse_formality_json
 BASE = "https://dichvucong.gov.vn"
 LIST_URL = f"{BASE}/api/v1/submitting/formality/list-all-formality-by-citizen"
 DETAIL_URL = f"{BASE}/api/v1/configuring/formality/get-formality-by-citizen"
+DEPARTMENTS_URL = f"{BASE}/api/v1/configuring/citizen/department/list-with-location"
 ATTACHMENT_URL = f"{BASE}/api/v1/submitting/preview-attachment"
 WARMUP_URL = f"{BASE}/thu-tuc-hanh-chinh"
 
@@ -162,20 +163,16 @@ async def list_procedures_page(
 async def discover_all_procedures(
     client: httpx.AsyncClient,
     *,
-    department_promulgate_id: str | None = None,
     department_code: str = "",
     q: str = "",
     page_size: int = 50,
     max_pages: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Paginate toàn bộ list. Stop khi `items` rỗng.
+    Paginate list-all-formality. Stop khi `items` rỗng hoặc lastId không tiến.
 
-    Filter cơ quan:
-      - `department_code` → pass thẳng vào body (server lọc theo CODE)
-      - `department_promulgate_id` → client-side filter sau khi nhận page
-        (vì API không có field filter theo departmentPromulgateId trực tiếp
-        trong body request).
+    Filter cơ quan dùng `department_code` (vd "G19", "D01"). Lấy code từ
+    `fetch_agency_list` → server lọc thật sự, không phải client-side.
     """
     out: list[dict[str, Any]] = []
     last_id = ""
@@ -197,18 +194,10 @@ async def discover_all_procedures(
         if not items:
             break
 
-        if department_promulgate_id:
-            filtered = [
-                it for it in items
-                if str(it.get("departmentPromulgateId") or "") == department_promulgate_id
-            ]
-            out.extend(filtered)
-        else:
-            out.extend(items)
+        out.extend(items)
 
         new_last = data.get("lastId") or ""
         if not new_last or new_last == last_id:
-            # Không có cursor để page tiếp
             break
         last_id = new_last
         logger.debug(
@@ -218,7 +207,7 @@ async def discover_all_procedures(
 
     logger.info(
         f"DVCQG | discover | done | items={len(out)} "
-        f"(dept_id={department_promulgate_id} dept_code={department_code} q={q!r})"
+        f"(dept_code={department_code!r} q={q!r})"
     )
     return out
 
@@ -248,45 +237,81 @@ async def get_procedure_detail(
 
 # ── Agencies ──────────────────────────────────────────────────────────────────
 
-async def fetch_agency_list(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+async def fetch_agency_list(
+    client: httpx.AsyncClient,
+    *,
+    levels: list[str] | None = None,
+    page_size: int = 50,
+) -> list[dict[str, Any]]:
     """
-    API mới không có endpoint list cơ quan riêng cho citizen. Suy ra từ list-all:
-    group theo (departmentPromulgateId, departmentPromulgate).
+    Lấy danh sách cơ quan từ endpoint chính thức
+    `/configuring/citizen/department/list-with-location`.
 
-    Lấy hết các page để đảm bảo cover tất cả cơ quan. Vì list có ~5400 thủ tục
-    nên chỉ tốn ~100 request page_size=50 — chấp nhận được trong context UI admin.
+    `levels`: lọc theo cấp. Mặc định ["MINISTRY"] (chỉ Bộ/cơ quan TW).
+    Pass ["PROVINCE"] để lấy UBND tỉnh, hoặc None để không filter.
 
-    Trả về list {id, name, code, count}.
+    Trả về list {id, name, code, level, hasChild} — `code` chính là
+    `departmentCode` dùng được trong list-all body để filter server-side.
     """
-    seen: dict[str, dict[str, Any]] = {}
+    out: list[dict[str, Any]] = []
     last_id = ""
-    page_num = 0
+    levels_payload = levels if levels is not None else ["MINISTRY"]
+    # `type` body field: server đòi 1 string; nếu nhiều levels thì pass cái đầu
+    type_field = levels_payload[0] if levels_payload else "MINISTRY"
+
     while True:
-        page_num += 1
-        data = await list_procedures_page(client, last_id, limit=100)
-        if data is None:
+        payload: dict[str, Any] = {
+            "direction": "DESC",
+            "order": "",
+            "type": type_field,
+            "agencyLevel": "level_1",
+            "lastId": last_id,
+            "levels": levels_payload,
+            "limit": page_size,
+        }
+        r = await _post_with_retry(client, DEPARTMENTS_URL, payload)
+        if r is None:
             break
-        items = data.get("items") or []
-        if not items:
+        try:
+            body = r.json()
+        except Exception as e:
+            logger.warning(f"DVCQG | agencies json decode failed | {e}")
             break
-        for it in items:
-            dep_id = str(it.get("departmentPromulgateId") or "").strip()
-            if not dep_id:
-                continue
-            name = (it.get("departmentPromulgate") or "").strip()
-            entry = seen.get(dep_id)
-            if entry:
-                entry["count"] += 1
-            else:
-                seen[dep_id] = {"id": dep_id, "name": name, "code": "", "count": 1}
+        if body.get("code") != "OK":
+            logger.warning(f"DVCQG | agencies non-OK | code={body.get('code')}")
+            break
+
+        data = body.get("data") or {}
+        rows = data.get("rows") or []
+        if not rows:
+            break
+        for row in rows:
+            out.append({
+                "id": str(row.get("id") or "").strip(),
+                "name": (row.get("name") or "").strip(),
+                "code": (row.get("code") or "").strip(),
+                "level": (row.get("level") or "").strip(),
+                "has_child": bool(row.get("hasChild")),
+            })
+
         new_last = data.get("lastId") or ""
         if not new_last or new_last == last_id:
             break
         last_id = new_last
 
-    agencies = sorted(seen.values(), key=lambda a: a["name"].lower())
-    logger.info(f"DVCQG | fetch_agency_list | {len(agencies)} agencies from {page_num} pages")
-    return agencies
+    # Dedupe by code (safety; thường server đã unique)
+    seen_codes: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for a in out:
+        if a["code"] and a["code"] in seen_codes:
+            continue
+        seen_codes.add(a["code"])
+        unique.append(a)
+    unique.sort(key=lambda a: a["name"].lower())
+    logger.info(
+        f"DVCQG | fetch_agency_list | {len(unique)} agencies (levels={levels_payload})"
+    )
+    return unique
 
 
 # ── Orchestrator: fetch_and_parse 1 procedure ─────────────────────────────────

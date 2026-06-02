@@ -69,21 +69,34 @@ async def trigger_crawl(
 # ── Danh sách bộ/ngành (lấy động từ API DVCQG, không dùng file local) ──────────
 
 @router.get("/agencies", response_model=list[AgencyItem])
-async def list_agencies(_: User = Depends(require_admin)):
+async def list_agencies(
+    level: str = Query(
+        "MINISTRY",
+        description="Cấp cơ quan: MINISTRY (Bộ/TW), PROVINCE (UBND tỉnh), all",
+    ),
+    _: User = Depends(require_admin),
+):
     """
-    Lấy danh sách cơ quan (bộ/ngành) trực tiếp từ Cổng DVCQG để admin chọn crawl.
+    Lấy danh sách cơ quan (theo cấp) từ endpoint chính thức:
+    `/api/v1/configuring/citizen/department/list-with-location`.
 
-    NOTE: API mới không có endpoint list cơ quan riêng → derive bằng cách paginate
-    list-all-formality rồi group theo departmentPromulgateId. Mỗi page 100 thủ tục,
-    tổng ~5400 → ~55 request. Có thể chậm 30-60s, cân nhắc cache phía client.
+    Mặc định chỉ trả MINISTRY (Bộ + cơ quan TW). Pass `level=PROVINCE` để
+    crawl UBND tỉnh. `code` trong response chính là `departmentCode` dùng
+    để filter server-side khi crawl.
     """
     from app.crawler.sources.dvcqg_json import _warmup, fetch_agency_list
+
+    lvl = (level or "").strip().upper()
+    if lvl in ("", "ALL"):
+        levels = None
+    else:
+        levels = [lvl]
 
     async with httpx.AsyncClient(
         http2=False, follow_redirects=True, timeout=60
     ) as client:
         await _warmup(client)
-        agencies = await fetch_agency_list(client)
+        agencies = await fetch_agency_list(client, levels=levels)
 
     if not agencies:
         raise HTTPException(
@@ -91,7 +104,9 @@ async def list_agencies(_: User = Depends(require_admin)):
             detail="Không lấy được danh sách cơ quan từ Cổng DVCQG.",
         )
     return [
-        AgencyItem(id=a["id"], name=a["name"], code=a.get("code") or None)
+        AgencyItem(
+            id=a["id"], name=a["name"], code=a["code"], level=a.get("level")
+        )
         for a in agencies
     ]
 
@@ -104,11 +119,17 @@ async def crawl_agency(
 ):
     """
     Crawl toàn bộ thủ tục của 1 bộ/ngành.
-    Tạo (hoặc tái sử dụng) 1 DocumentSource với source_url = agency_id rồi enqueue task.
+
+    `agency_code` = `departmentCode` của API DVCQG (vd "G19" cho Ngân hàng Nhà
+    nước). Crawler dùng code này để filter server-side trong list-all → tiết
+    kiệm rất nhiều API request so với derive từ list-all rồi lọc client.
+
+    Lưu source_url = agency_code (ngắn, server thật sự dùng). Dedupe trên code.
     """
-    # Idempotent: dedupe theo source_url = agency_id
+    code = payload.agency_code.strip()
+    # Idempotent: dedupe theo source_url = agency_code
     existing = (await db.execute(
-        select(DocumentSource).where(DocumentSource.source_url == payload.agency_id)
+        select(DocumentSource).where(DocumentSource.source_url == code)
     )).scalar_one_or_none()
 
     if existing:
@@ -118,8 +139,8 @@ async def crawl_agency(
         source.is_active = True
     else:
         source = DocumentSource(
-            title=(payload.agency_name or f"Cơ quan {payload.agency_id}")[:300],
-            source_url=payload.agency_id,
+            title=(payload.agency_name or f"Cơ quan {code}")[:300],
+            source_url=code,
             source_type="dvcqg_agency",
             is_active=True,
             crawl_frequency=CrawlFrequency.MANUAL,
@@ -133,7 +154,7 @@ async def crawl_agency(
     return CrawlTriggerResponse(
         task_id=task.id,
         source_id=source.id,
-        message=f"Đã kích hoạt crawl bộ/ngành '{source.title}'.",
+        message=f"Đã kích hoạt crawl bộ/ngành '{source.title}' (code={code}).",
     )
 
 
