@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Boolean, Date, DateTime, Enum, ForeignKey, Integer,
+    BigInteger, Boolean, Date, DateTime, Enum, ForeignKey, Integer,
     String, Text, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -68,6 +68,11 @@ class Procedure(Base):
     # Dùng cho change detection: nếu hash giống lần crawl trước → SKIP re-embed,
     # tiết kiệm quota embedding API.
     content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+
+    # `updatedAt` (epoch milliseconds) lấy trực tiếp từ JSON API DVCQG.
+    # Ưu tiên dùng field này cho change detection: chỉ cần list-all rồi so sánh
+    # với DB, không phải tải full detail mới biết có thay đổi hay không.
+    source_updated_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
 
     status: Mapped[str] = mapped_column(
         Enum(ProcedureStatus, values_callable=lambda x: [e.value for e in x]),
