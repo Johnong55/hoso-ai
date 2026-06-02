@@ -24,6 +24,7 @@ Output dict keys:
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 
 # ── Map submissionMethod sang tên tiếng Việt nhất quán với DB cũ ──────────────
@@ -43,14 +44,22 @@ _TIME_UNIT_MAP = {
     "YEAR": "Năm",
 }
 
-# Base URL cho download biểu mẫu
-_ATTACHMENT_URL = (
-    "https://dichvucong.gov.vn/api/v1/submitting/preview-attachment?fileId={id}"
-)
+# Path tới proxy backend GET (frontend prepends API base origin).
+# Backend (forms.py) sẽ POST hộ sang DVCQG /preview-attachment.
+_PROXY_PATH = "/api/v1/forms/{id}"
 
 
-def _build_form_url(attachment_id: str) -> str:
-    return _ATTACHMENT_URL.format(id=attachment_id)
+def _build_form_url(attachment_id: str, file_name: str | None = None) -> str:
+    """
+    Trả về URL proxy backend tải biểu mẫu. Browser GET URL này thay vì
+    GET trực tiếp DVCQG (DVCQG từ chối GET, đòi POST với body fileId).
+
+    Đính kèm `?name=<filename>` để browser lưu đúng tên gốc (RFC 5987).
+    """
+    url = _PROXY_PATH.format(id=attachment_id)
+    if file_name:
+        url += f"?name={quote(file_name)}"
+    return url
 
 
 def _norm_method(raw: str | None) -> str:
@@ -195,7 +204,7 @@ def _flatten_requirements(execution_cases: list[dict[str, Any]]) -> list[dict[st
                 form_name = (first.get("fileName") or "").strip() or None
                 att_id = (first.get("id") or "").strip()
                 if att_id:
-                    form_url = _build_form_url(att_id)
+                    form_url = _build_form_url(att_id, file_name=form_name)
 
             out.append({
                 "name": name,
