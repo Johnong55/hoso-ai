@@ -163,8 +163,10 @@ class Settings(BaseSettings):
     # Thư mục chứa các file .xlsx danh sách thủ tục (1 file/bộ-ngành)
     # Code lấy mã TTHC từ cột "Mã TTHC" rồi gọi rest.jsp + export_word_detail_tthc.jsp.
     XLSX_DATA_DIR: str = "./data/tthc"
-    # Concurrency cho fetch song song khi crawl theo danh sách mã
+    # Concurrency cho fetch song song khi crawl theo danh sách mã (legacy xlsx)
     XLSX_CRAWL_CONCURRENCY: int = 5
+    # Concurrency cho crawler JSON API mới
+    DVCQG_CRAWL_CONCURRENCY: int = 5
 
 
 @lru_cache
