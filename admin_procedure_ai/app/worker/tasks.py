@@ -2,20 +2,19 @@
 """
 Celery tasks cho crawl + embed thủ tục hành chính.
 
-Flow mới (xlsx-based):
+Flow (JSON API mới của dichvucong.gov.vn):
   DocumentSource.source_url quy định phạm vi crawl:
-    - "" hoặc "all"  → tất cả file .xlsx trong settings.XLSX_DATA_DIR
-    - "<tên>.xlsx"   → chỉ file đó (path tương đối trong XLSX_DATA_DIR)
+    - "" hoặc "all"  → toàn bộ thủ tục (paginate hết list-all-formality)
+    - "<UUID>"       → 1 bộ/ngành cụ thể (filter theo departmentPromulgateId)
 
   Pipeline mỗi task run:
-    1. Đọc xlsx → list mã TTHC (cột "Mã TTHC")
-    2. Với mỗi mã: rest.jsp lookup idTTHC → tải .docx → parse
-    3. Upsert vào DB (Procedure + Fees + Requirements + Steps)
-    4. Chunking + embed sang Qdrant
+    1. discover_all_procedures → list item (id, code, ...) từ list-all API
+    2. Với mỗi item: get detail → parse → upsert DB
+    3. Chunking + embed sang Qdrant
+    4. Change detection: skip embed nếu procedure.source_updated_at == API.updatedAt
 """
 import asyncio
 from datetime import datetime, timezone
-from pathlib import Path
 
 from loguru import logger
 
@@ -51,23 +50,18 @@ def _run_async(coro):
     default_retry_delay=60,
 )
 def crawl_and_embed_procedure(self, source_id: str) -> dict:
-    """
-    Crawl danh sách mã TTHC từ xlsx → tải docx → parse → embed.
-    """
+    """Discover thủ tục qua list-all → tải detail JSON → parse → upsert → embed."""
     return _run_async(_crawl_and_embed_async(self, source_id))
 
 
 async def _crawl_and_embed_async(task, source_id: str) -> dict:
-    import httpx
     from sqlalchemy import select
 
     from app.core.config import settings
     from app.db.base import AsyncSessionLocal
     from app.models.document import CrawlStatus, ProcessingStatus, DocumentSource
-    from app.crawler.sources.dvcqg_xlsx import (
-        collect_all_codes_online,
-        read_codes_from_xlsx,
-        resolve_agency_id,
+    from app.crawler.sources.dvcqg_json import (
+        discover_all_procedures,
         fetch_procedures,
     )
 
@@ -83,50 +77,44 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
         await db.commit()
 
         try:
-            # ── Xác định danh sách mã TTHC cần crawl ──────────────────────────
-            # source_url quy định phạm vi:
-            #   ""/"all"          → ONLINE, tất cả cơ quan (qua API)
-            #   "<tên CQ>"/"<id>" → ONLINE, 1 cơ quan (resolve qua API)
-            #   "<file>.xlsx"     → LOCAL, đọc file trong XLSX_DATA_DIR
+            # source_url:
+            #   ""/"all"  → discover toàn bộ
+            #   "<UUID>"  → filter theo departmentPromulgateId (1 bộ/ngành)
             scope = (source.source_url or "").strip()
             scope_low = scope.lower()
 
-            if scope_low.endswith(".xlsx"):
-                # LOCAL file mode
-                xlsx_path = Path(settings.XLSX_DATA_DIR) / scope
-                if not xlsx_path.exists():
-                    raise FileNotFoundError(f"xlsx file not found: {xlsx_path}")
-                code_metas = read_codes_from_xlsx(xlsx_path)
-                for m in code_metas:
-                    m["source_xlsx"] = xlsx_path.name
-                logger.info(f"Task | scope=LOCAL FILE | file={xlsx_path.name} | codes={len(code_metas)}")
-            else:
-                # ONLINE mode
-                async with httpx.AsyncClient(follow_redirects=True) as client:
-                    if scope_low in ("", "all"):
-                        code_metas = await collect_all_codes_online(client)
-                        logger.info(f"Task | scope=ONLINE ALL | codes={len(code_metas)}")
-                    else:
-                        agency_id = await resolve_agency_id(client, scope)
-                        if not agency_id:
-                            raise ValueError(f"Không tìm thấy cơ quan khớp '{scope}'")
-                        code_metas = await collect_all_codes_online(client, agency_id=agency_id)
-                        logger.info(
-                            f"Task | scope=ONLINE AGENCY | '{scope}' (id={agency_id}) "
-                            f"| codes={len(code_metas)}"
-                        )
+            import httpx
+            from app.crawler.sources.dvcqg_json import _warmup, HEADERS  # noqa: F401
 
-            if not code_metas:
-                raise ValueError(f"Không có mã TTHC nào từ scope='{scope or 'all'}'")
+            async with httpx.AsyncClient(
+                http2=False, follow_redirects=True, timeout=settings.CRAWLER_TIMEOUT
+            ) as client:
+                await _warmup(client)
+
+                if scope_low in ("", "all"):
+                    items = await discover_all_procedures(client)
+                    logger.info(f"Task | scope=ALL | items={len(items)}")
+                else:
+                    # scope = departmentPromulgateId (UUID). Hiện chưa hỗ trợ
+                    # resolve theo tên — UI luôn truyền UUID.
+                    items = await discover_all_procedures(
+                        client, department_promulgate_id=scope
+                    )
+                    logger.info(
+                        f"Task | scope=AGENCY id={scope} | items={len(items)}"
+                    )
+
+            if not items:
+                raise ValueError(f"Không có thủ tục nào từ scope='{scope or 'all'}'")
 
             # ── Fetch + parse + save từng procedure ───────────────────────────
             total_chunks = 0
             ok = 0
-            skipped = 0       # procedures không đổi → không embed lại (tiết kiệm quota)
+            skipped = 0       # procedures không đổi → không embed lại
             failed = 0
-            concurrency = settings.XLSX_CRAWL_CONCURRENCY
+            concurrency = settings.DVCQG_CRAWL_CONCURRENCY
 
-            async for code, parsed in fetch_procedures(code_metas, concurrency=concurrency):
+            async for code, parsed in fetch_procedures(items, concurrency=concurrency):
                 if not parsed:
                     failed += 1
                     continue
@@ -153,12 +141,12 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
             logger.info(
                 f"Task | crawl | done | source_id={source_id} "
-                f"| codes={len(code_metas)} | ok={ok} | skipped={skipped} "
+                f"| items={len(items)} | ok={ok} | skipped={skipped} "
                 f"| failed={failed} | chunks={total_chunks}"
             )
             return {
                 "status": "success",
-                "codes": len(code_metas),
+                "items": len(items),
                 "ok": ok,
                 "skipped": skipped,
                 "failed": failed,
@@ -176,54 +164,6 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 SKIPPED_UNCHANGED = -1  # sentinel: procedure không đổi → skip embed
 
 
-def _compute_procedure_hash(parsed: dict) -> str:
-    """
-    SHA256 deterministic của các trường ảnh hưởng đến chunks/embed.
-    Dùng để skip re-embed khi nội dung không đổi giữa các lần crawl.
-    """
-    import hashlib
-    import json
-
-    # Chỉ lấy các field quan trọng (bỏ id, vector_id, timestamps...).
-    # Sort dict để hash deterministic bất kể thứ tự key.
-    payload = {
-        "name": parsed.get("name"),
-        "domain": parsed.get("domain"),
-        "description": parsed.get("description"),
-        "conditions": parsed.get("conditions"),
-        "result": parsed.get("result"),
-        "legal_basis": parsed.get("legal_basis"),
-        "steps_text": parsed.get("steps_text"),
-        "fees": sorted(
-            [
-                {
-                    "method": f.get("submission_method"),
-                    "time": f.get("processing_time"),
-                    "amount": f.get("amount_text"),
-                    "desc": f.get("description"),
-                }
-                for f in parsed.get("fees") or []
-            ],
-            key=lambda x: (x["method"] or "", x["amount"] or ""),
-        ),
-        "requirements": sorted(
-            [
-                {
-                    "name": r.get("name"),
-                    "case_group": r.get("case_group"),
-                    "form_name": r.get("form_name"),
-                    "form_url": r.get("form_url"),
-                    "quantity": r.get("quantity"),
-                }
-                for r in parsed.get("requirements") or []
-            ],
-            key=lambda x: (x["case_group"] or "", x["name"] or ""),
-        ),
-    }
-    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
 async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
     """
     Nhận parsed dict từ dvcqg_docx_parser → upsert DB + chunk + embed.
@@ -234,7 +174,6 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
        0  → procedure không có chunks (trống)
       >0  → số chunks mới đã embed
     """
-    import hashlib
     from sqlalchemy import delete, func, select
 
     from app.core.config import settings
@@ -258,17 +197,20 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                 logger.warning("Task | missing code in parsed dict, skip")
                 return 0
 
-            # Compute hash EARLY — gate cho việc skip embed
-            new_hash = _compute_procedure_hash(parsed)
+            api_updated_at = parsed.get("source_updated_at")  # epoch ms từ API
 
             existing = (await db.execute(
                 select(Procedure).where(Procedure.code == code)
             )).scalar_one_or_none()
 
-            # ── EARLY EXIT: nội dung không đổi + chunks vẫn còn ──────────────
-            if existing and existing.content_hash == new_hash:
-                # Verify chunks vẫn còn (tránh trường hợp Qdrant đã bị xoá nhưng
-                # DB còn lưu hash cũ → vẫn cần re-embed)
+            # ── EARLY EXIT: API.updatedAt không đổi + chunks vẫn còn ─────────
+            # source_updated_at là gốc thật ở phía server — chính xác hơn hash
+            # nội dung, không bị ảnh hưởng bởi thay đổi format/cosmetic.
+            if (
+                existing
+                and api_updated_at is not None
+                and existing.source_updated_at == api_updated_at
+            ):
                 chunk_count = (await db.execute(
                     select(func.count(DocumentChunk.id)).where(
                         DocumentChunk.procedure_id == existing.id,
@@ -278,9 +220,8 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                 if chunk_count > 0:
                     logger.info(
                         f"Task | UNCHANGED, skip embed | code={code} "
-                        f"| existing_chunks={chunk_count}"
+                        f"| existing_chunks={chunk_count} | updatedAt={api_updated_at}"
                     )
-                    # Vẫn touch updated_at để biết lần crawl gần nhất
                     existing.status = ProcedureStatus.ACTIVE
                     await db.commit()
                     return SKIPPED_UNCHANGED
@@ -369,12 +310,6 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                     description=steps_text,
                 ))
 
-            # ── Change detection cho chunks ──────────────────────────────────
-            content_hash = hashlib.sha256(
-                (steps_text + (parsed.get("fee_summary") or "") + str(parsed.get("requirements", "")))
-                .encode("utf-8")
-            ).hexdigest()
-
             source_result = await db.execute(
                 select(DocumentSource).where(DocumentSource.id == source_id)
             )
@@ -435,10 +370,10 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                     embedding_status=EmbeddingStatus.DONE,
                 ))
 
-            # Cập nhật hash mới cho procedure → lần crawl sau sẽ compare
-            procedure.content_hash = new_hash
+            # Cập nhật source_updated_at để lần crawl sau skip nếu API không đổi
+            if api_updated_at is not None:
+                procedure.source_updated_at = api_updated_at
 
-            source.content_hash = content_hash
             source.processing_status = ProcessingStatus.EMBEDDED
 
             # ── Commit ngay cho procedure này ────────────────────────────────
@@ -495,12 +430,16 @@ def crawl_single_procedure(self, code: str) -> dict:
 
 async def _crawl_single_async(task, code: str) -> dict:
     import httpx
-    from app.crawler.sources.dvcqg_xlsx import fetch_and_parse_procedure
+    from app.core.config import settings
+    from app.crawler.sources.dvcqg_json import _warmup, fetch_and_parse_procedure
 
     source_id = await _ensure_manual_source()
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            http2=False, follow_redirects=True, timeout=settings.CRAWLER_TIMEOUT
+        ) as client:
+            await _warmup(client)
             parsed = await fetch_and_parse_procedure(client, code)
 
         if not parsed:

@@ -72,10 +72,17 @@ async def trigger_crawl(
 async def list_agencies(_: User = Depends(require_admin)):
     """
     Lấy danh sách cơ quan (bộ/ngành) trực tiếp từ Cổng DVCQG để admin chọn crawl.
-    """
-    from app.crawler.sources.dvcqg_xlsx import fetch_agency_list
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    NOTE: API mới không có endpoint list cơ quan riêng → derive bằng cách paginate
+    list-all-formality rồi group theo departmentPromulgateId. Mỗi page 100 thủ tục,
+    tổng ~5400 → ~55 request. Có thể chậm 30-60s, cân nhắc cache phía client.
+    """
+    from app.crawler.sources.dvcqg_json import _warmup, fetch_agency_list
+
+    async with httpx.AsyncClient(
+        http2=False, follow_redirects=True, timeout=60
+    ) as client:
+        await _warmup(client)
         agencies = await fetch_agency_list(client)
 
     if not agencies:
@@ -83,7 +90,10 @@ async def list_agencies(_: User = Depends(require_admin)):
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Không lấy được danh sách cơ quan từ Cổng DVCQG.",
         )
-    return [AgencyItem(id=a["id"], name=a["name"], code=a.get("code")) for a in agencies]
+    return [
+        AgencyItem(id=a["id"], name=a["name"], code=a.get("code") or None)
+        for a in agencies
+    ]
 
 
 @router.post("/crawl-agency", response_model=CrawlTriggerResponse)
