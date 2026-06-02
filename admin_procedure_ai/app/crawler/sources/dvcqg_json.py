@@ -352,9 +352,7 @@ async def fetch_procedures(
     và 'code'). Bounded concurrency qua semaphore. Dùng chung 1 client để
     tận dụng connection + cookie warmup.
     """
-    conc = concurrency or getattr(
-        settings, "DVCQG_CRAWL_CONCURRENCY", settings.XLSX_CRAWL_CONCURRENCY
-    )
+    conc = concurrency or settings.DVCQG_CRAWL_CONCURRENCY
     sem = asyncio.Semaphore(conc)
     items_list = list(items)
 

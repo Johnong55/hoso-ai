@@ -33,9 +33,7 @@ email-validator==2.2.0
 celery==5.4.0
 redis==5.0.8
 
-# Crawler — xlsx-based flow uses httpx + openpyxl only
-# (playwright/beautifulsoup gỡ vì không còn dùng trong app code.
-#  Debug scripts cũ vẫn import — nếu cần chạy lại, cài tay: pip install playwright bs4 lxml)
+# Crawler — JSON API DVCQG dùng httpx async
 httpx==0.27.2
 
 # Embedding — Gemini

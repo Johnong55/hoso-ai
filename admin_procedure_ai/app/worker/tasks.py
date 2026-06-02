@@ -166,7 +166,7 @@ SKIPPED_UNCHANGED = -1  # sentinel: procedure không đổi → skip embed
 
 async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
     """
-    Nhận parsed dict từ dvcqg_docx_parser → upsert DB + chunk + embed.
+    Nhận parsed dict từ dvcqg_json_parser → upsert DB + chunk + embed.
     Dùng session riêng + commit ngay → không bị ảnh hưởng bởi procedure khác.
 
     Trả về:

@@ -160,12 +160,7 @@ class Settings(BaseSettings):
     CRAWLER_TIMEOUT: int = 30
     CRAWL_SCHEDULE_HOUR: int = 2
     CRAWL_SCHEDULE_MINUTE: int = 0
-    # Thư mục chứa các file .xlsx danh sách thủ tục (1 file/bộ-ngành)
-    # Code lấy mã TTHC từ cột "Mã TTHC" rồi gọi rest.jsp + export_word_detail_tthc.jsp.
-    XLSX_DATA_DIR: str = "./data/tthc"
-    # Concurrency cho fetch song song khi crawl theo danh sách mã (legacy xlsx)
-    XLSX_CRAWL_CONCURRENCY: int = 5
-    # Concurrency cho crawler JSON API mới
+    # Concurrency cho crawler JSON API DVCQG
     DVCQG_CRAWL_CONCURRENCY: int = 5
 
 
