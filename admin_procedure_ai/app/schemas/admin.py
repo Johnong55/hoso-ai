@@ -67,6 +67,22 @@ class CrawlByCodeResponse(BaseModel):
     message: str
 
 
+class SourceProcedureItem(BaseModel):
+    """1 thủ tục trong drill-down của 1 source."""
+    code: str
+    name: str
+    domain: str | None = None
+    chunk_count: int = 0
+    updated_at: datetime | None = None
+
+
+class SourceProceduresResponse(BaseModel):
+    items: list[SourceProcedureItem]
+    total: int
+    page: int
+    page_size: int
+
+
 class RAGStatsResponse(BaseModel):
     total_procedures: int
     total_chunks: int

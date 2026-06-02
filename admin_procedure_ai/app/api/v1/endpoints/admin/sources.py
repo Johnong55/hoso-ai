@@ -1,11 +1,12 @@
 # app/api/v1/endpoints/admin/sources.py
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_db, require_admin
-from app.models.document import CrawlFrequency, DocumentSource
+from app.models.document import CrawlFrequency, DocumentChunk, DocumentSource
+from app.models.procedure import Procedure
 from app.models.user import User
 from app.schemas.admin import (
     AgencyItem,
@@ -16,6 +17,8 @@ from app.schemas.admin import (
     CrawlTriggerResponse,
     DocumentSourceCreate,
     DocumentSourceResponse,
+    SourceProceduresResponse,
+    SourceProcedureItem,
 )
 from app.schemas.common import MessageResponse
 
@@ -137,6 +140,58 @@ async def crawl_procedure(
         code=payload.code,
         message=f"Đã kích hoạt crawl thủ tục {payload.code}.",
     )
+
+
+@router.get("/{source_id}/procedures", response_model=SourceProceduresResponse)
+async def list_source_procedures(
+    source_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Drill-down: liệt kê các thủ tục thuộc 1 source (đã crawl + còn chunks
+    is_current=True). Sort theo procedure.updated_at desc.
+    """
+    # Subquery: đếm chunks hiện tại per procedure trong source này
+    chunks_sub = (
+        select(
+            DocumentChunk.procedure_id.label("pid"),
+            func.count(DocumentChunk.id).label("chunks"),
+        )
+        .where(
+            DocumentChunk.source_id == source_id,
+            DocumentChunk.is_current.is_(True),
+            DocumentChunk.procedure_id.is_not(None),
+        )
+        .group_by(DocumentChunk.procedure_id)
+        .subquery()
+    )
+
+    total = (await db.execute(
+        select(func.count()).select_from(chunks_sub)
+    )).scalar() or 0
+
+    rows = (await db.execute(
+        select(Procedure, chunks_sub.c.chunks)
+        .join(chunks_sub, Procedure.id == chunks_sub.c.pid)
+        .order_by(Procedure.updated_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )).all()
+
+    items = [
+        SourceProcedureItem(
+            code=p.code,
+            name=p.name,
+            domain=p.domain,
+            chunk_count=int(cc),
+            updated_at=p.updated_at,
+        )
+        for p, cc in rows
+    ]
+    return SourceProceduresResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 @router.delete("/{source_id}", response_model=MessageResponse)
