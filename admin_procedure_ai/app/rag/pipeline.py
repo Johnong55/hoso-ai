@@ -89,7 +89,7 @@ class RAGPipeline:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    _MAX_AUGMENT_PROCEDURES = 2     # chỉ augment top 1-2 procedure để không phình context
+    _MAX_AUGMENT_PROCEDURES = 1     # chỉ augment TOP 1: nhồi 2 procedure full → blow max_tokens
 
     async def _augment_step_chunks(
         self, chunks: list[RetrievedChunk]

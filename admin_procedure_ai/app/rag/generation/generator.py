@@ -35,8 +35,13 @@ QUY TẮC:
    - Nêu rõ TÊN ĐẦY ĐỦ của thủ tục áp dụng
    - Giải thích vì sao thủ tục này áp dụng cho tình huống của họ
    - Liệt kê hồ sơ / trình tự / lệ phí / cơ quan thực hiện (lấy từ ngữ cảnh)
-3. Nếu trong [NGỮ CẢNH] có NHIỀU thủ tục có thể liên quan, liệt kê 2-3 thủ tục
-   khả dĩ kèm phân biệt nhanh, rồi hỏi lại để xác nhận tình huống của họ.
+3. Khi [NGỮ CẢNH] có NHIỀU thủ tục liên quan:
+   - CHỌN 1 thủ tục KHỚP NHẤT với tình huống → trả lời CHI TIẾT thủ tục đó
+     (đầy đủ Bước 1-N, hồ sơ, lệ phí, cơ quan...).
+   - Các thủ tục liên quan KHÁC chỉ cần nêu cuối câu trả lời 1 dòng ngắn:
+     "Nếu tình huống của bạn là [X], có thể xem thêm: <tên + mã thủ tục>".
+   - KHÔNG list dài 2-3 thủ tục song song — sẽ vượt budget, user không
+     đọc hết.
 3b. KHI [NGỮ CẢNH] có chunk "Trình tự thực hiện (FULL — KHÔNG được rút gọn)":
    PHẢI liệt kê NGUYÊN VĂN toàn bộ Bước 1, 2, 3, ... đến hết, kèm tất cả các
    sub-bullet (mô tả phương thức nộp, vai trò cán bộ tiếp nhận, thời gian tiếp
