@@ -41,7 +41,11 @@ QUY TẮC:
    Vui lòng liên hệ cơ quan có thẩm quyền để được hỗ trợ." khi [NGỮ CẢNH] HOÀN
    TOÀN không có thủ tục nào liên quan tới tình huống — đừng từ chối chỉ vì tên
    thủ tục không khớp từng từ với câu hỏi.
-5. Luôn trích dẫn nguồn (tên thủ tục đầy đủ) cuối câu trả lời.
+5. Luôn trích dẫn nguồn ở cuối câu trả lời theo định dạng:
+   `Nguồn: [Nguồn N] Thủ tục: <Tên đầy đủ> (mã: <X.XXXXXX>)`
+   Trong đó `<X.XXXXXX>` là mã thủ tục lấy trực tiếp từ [NGỮ CẢNH] (chunks
+   có metadata procedure_code). KHÔNG bịa mã. Nêu mã giúp hệ thống đính
+   đúng biểu mẫu của thủ tục được cite.
 6. Trả lời bằng tiếng Việt, rõ ràng, có cấu trúc bullet/đoạn ngắn dễ đọc.
 
 VÍ DỤ MAP TÌNH HUỐNG → THỦ TỤC:
@@ -261,6 +265,12 @@ class Generator:
         parts = []
         for i, chunk in enumerate(chunks, 1):
             procedure_name = chunk.metadata.get("procedure_name", "")
+            procedure_code = chunk.metadata.get("procedure_code", "")
             chunk_type = chunk.metadata.get("chunk_type", "")
-            parts.append(f"[Nguồn {i}] {procedure_name} ({chunk_type})\n{chunk.content}")
+            label = procedure_name
+            if procedure_code:
+                # Mã hiển thị trong context để LLM cite literal — giúp form filter
+                # khớp đúng thủ tục được trích trong câu trả lời.
+                label = f"{procedure_name} [mã: {procedure_code}]"
+            parts.append(f"[Nguồn {i}] {label} ({chunk_type})\n{chunk.content}")
         return "\n\n---\n\n".join(parts)

@@ -1,5 +1,6 @@
 # app/services/chat/chat_service.py
 import math
+import re
 
 from fastapi import HTTPException, status
 from loguru import logger
@@ -114,10 +115,12 @@ class ChatService:
         )
         messages = result.scalars().all()
 
-        # Re-derive forms cho ASSISTANT messages từ audit chain — chỉ form của
-        # TOP procedure (cùng logic với _build_forms khi live).
+        # Re-derive forms cho ASSISTANT messages từ audit chain.
+        # Cùng logic với _build_forms khi live: score gap nhỏ + filter theo mã
+        # thủ tục được cite literal trong text answer.
         forms_by_msg: dict[str, list[FormItem]] = {}
         assistant_ids = [m.id for m in messages if m.role == MessageRole.ASSISTANT]
+        msg_content_by_id = {m.id: m.content for m in messages if m.role == MessageRole.ASSISTANT}
         if assistant_ids:
             from app.models.document import DocumentChunk
             from app.models.procedure import Procedure, ProcedureRequirement
@@ -147,8 +150,20 @@ class ChatService:
             for msg_id, lst in grouped.items():
                 lst.sort(key=lambda x: -x[1])
                 top = lst[0][1]
-                picks = [c for c, sc in lst if sc >= top - self._FORM_TOP_SCORE_GAP][:2]
-                top_codes_by_msg[msg_id] = set(picks)
+                score_picks = {c for c, sc in lst if sc >= top - self._FORM_TOP_SCORE_GAP}
+                # Citation tier — chỉ dùng literal mã thủ tục (không có [Nguồn N]
+                # mapping vì chunk order tại audit recovery không cố định).
+                content = msg_content_by_id.get(msg_id) or ""
+                cited = {m for m in self._PROC_CODE_RE.findall(content)}
+                if cited:
+                    final = score_picks & cited
+                    if not final:
+                        final = cited
+                else:
+                    final = score_picks
+                # Sort theo score, cap 2
+                ordered = sorted(final, key=lambda c: -next((sc for cc, sc in lst if cc == c), 0))
+                top_codes_by_msg[msg_id] = set(ordered[:2])
 
             # Pha 2: query form rows cho UNION các (msg_id, top_codes)
             all_top_codes = {c for s in top_codes_by_msg.values() for c in s}
@@ -233,7 +248,7 @@ class ChatService:
                 conversation_history=history,
             )
             sources = self._build_sources(result.chunks)
-            forms = await self._build_forms(result.chunks)
+            forms = await self._build_forms(result.chunks, answer_text=result.answer)
             logger.info(
                 f"Chat | ask | GUEST (no persist) | history={len(history)} "
                 f"| fallback={result.is_fallback} | latency={result.latency_ms}ms"
@@ -304,7 +319,7 @@ class ChatService:
             session.title = payload.question[:100]
 
         sources = self._build_sources(result.chunks)
-        forms = await self._build_forms(result.chunks)
+        forms = await self._build_forms(result.chunks, answer_text=result.answer)
         logger.info(
             f"Chat | ask | session_id={session.id} | user_id={user.id} "
             f"| fallback={result.is_fallback} | latency={result.latency_ms}ms | forms={len(forms)}"
@@ -323,14 +338,61 @@ class ChatService:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     # Chênh score tối đa giữa procedure thứ 2 và top để vẫn show form của nó.
-    # Tránh show form của thủ tục lạc khi retrieval nhiễu.
-    _FORM_TOP_SCORE_GAP = 0.05
+    # Hẹp hơn so với trước (0.05 → 0.02): embedding bge-m3 trên domain TTHC
+    # Việt nhiều cặp gần nhau (tạm trú/thường trú, gia hạn/cấp mới...) → cần
+    # gap nhỏ để chỉ giữ procedure thực sự sát top.
+    _FORM_TOP_SCORE_GAP = 0.02
 
-    async def _build_forms(self, chunks: list[RetrievedChunk]) -> list[FormItem]:
+    # Pattern bắt mã thủ tục dạng "1.001020", "2.000123" trong text answer.
+    _PROC_CODE_RE = re.compile(r"\b\d+\.\d{4,}\b")
+    _SOURCE_REF_RE = re.compile(r"\[\s*Nguồn\s+(\d+)\s*\]", re.IGNORECASE)
+
+    def _extract_cited_codes(
+        self, answer: str | None, chunks: list[RetrievedChunk]
+    ) -> set[str]:
         """
-        Lấy biểu mẫu tải về CHỈ của thủ tục chính (procedure có chunk điểm cao nhất).
-        Bao gồm procedure thứ 2 nếu score sát top (chênh ≤ _FORM_TOP_SCORE_GAP) —
-        khi LLM có thể đang phân vân giữa 2 thủ tục liên quan.
+        Tìm tập procedure_code mà LLM thực sự cite trong câu trả lời.
+
+        2 nguồn:
+          1. Mã thủ tục literal trong text (vd "thủ tục 1.003460").
+          2. Reference dạng [Nguồn N] → map ngược về chunks[N-1].procedure_code.
+
+        Trả về tập rỗng nếu không cite gì → caller fallback dùng score-only.
+        """
+        codes: set[str] = set()
+        if not answer:
+            return codes
+
+        # 1. Literal code trong text
+        for m in self._PROC_CODE_RE.findall(answer):
+            codes.add(m)
+
+        # 2. [Nguồn N] → chunk index
+        for m in self._SOURCE_REF_RE.findall(answer):
+            try:
+                idx = int(m) - 1
+            except ValueError:
+                continue
+            if 0 <= idx < len(chunks):
+                code = chunks[idx].metadata.get("procedure_code")
+                if code:
+                    codes.add(str(code))
+        return codes
+
+    async def _build_forms(
+        self,
+        chunks: list[RetrievedChunk],
+        answer_text: str | None = None,
+    ) -> list[FormItem]:
+        """
+        Lấy biểu mẫu CHỈ của thủ tục thực sự được nêu trong câu trả lời.
+
+        Filter 2 tầng:
+          - Score tier: procedure có chunk score ≥ top - GAP (gap=0.02)
+          - Citation tier: procedure được LLM cite (mã literal hoặc [Nguồn N])
+
+        Giao của 2 tập = procedure_code dùng cho form. Nếu LLM không cite gì
+        → fallback dùng score tier only.
         """
         from app.models.procedure import Procedure, ProcedureRequirement
 
@@ -345,10 +407,35 @@ class ChatService:
         if not best_score:
             return []
 
-        # Lọc procedure: top + những cái sát top
+        # Score tier
         top = max(best_score.values())
-        sorted_codes = sorted(best_score.items(), key=lambda x: -x[1])
-        codes = [code for code, sc in sorted_codes if sc >= top - self._FORM_TOP_SCORE_GAP][:2]
+        score_codes = {
+            code for code, sc in best_score.items()
+            if sc >= top - self._FORM_TOP_SCORE_GAP
+        }
+
+        # Citation tier
+        cited_codes = self._extract_cited_codes(answer_text, chunks)
+
+        # Intersect — citation thắng nếu có
+        if cited_codes:
+            final_codes = score_codes & cited_codes
+            if not final_codes:
+                # Edge: LLM cite procedure score thấp → ưu tiên cited
+                # (đáng tin hơn embedding score khi LLM đã đọc full context).
+                final_codes = cited_codes
+        else:
+            final_codes = score_codes
+
+        # Hardcap top 2 procedure để tránh spam form cards
+        codes = sorted(final_codes, key=lambda c: -best_score.get(c, 0))[:2]
+        if not codes:
+            return []
+        logger.debug(
+            f"Chat | build_forms | score_top={top:.3f} | "
+            f"score_codes={sorted(score_codes)} | cited={sorted(cited_codes)} | "
+            f"final={codes}"
+        )
 
         rows = (await self._db.execute(
             select(ProcedureRequirement, Procedure.name, Procedure.code)
