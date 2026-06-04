@@ -41,6 +41,35 @@ class FormItem(BaseModel):
     procedure_name: str | None = None
 
 
+# Kiểu section người dùng có thể tra cứu cho 1 thủ tục.
+# Frontend render chip dựa trên list này.
+SECTION_TYPES = {
+    "steps": "Trình tự thực hiện",
+    "requirements": "Giấy tờ cần chuẩn bị",
+    "fees": "Lệ phí & thời hạn",
+    "agency": "Cơ quan thực hiện",
+    "forms": "Biểu mẫu tải về",
+    "other_procedures": "Xem thủ tục khác",
+}
+
+
+class RelatedProcedure(BaseModel):
+    """Thủ tục liên quan (TOP-2, TOP-3) — chip 'Xem thủ tục khác' dẫn tới."""
+    code: str
+    name: str
+
+
+class ProcedureFocus(BaseModel):
+    """
+    Khi AI xác định được 1 thủ tục phù hợp tình huống, trả về structured
+    info để FE render chip row → user click → fetch section content.
+    """
+    code: str                                      # mã thủ tục (vd "1.003460")
+    name: str                                      # tên đầy đủ
+    available_chips: list[str]                     # subset của SECTION_TYPES keys
+    related: list[RelatedProcedure] = []           # thủ tục liên quan để chip "Xem thủ tục khác"
+
+
 class AskResponse(BaseModel):
     answer: str
     session_id: str
@@ -48,6 +77,30 @@ class AskResponse(BaseModel):
     sources: list[SourceItem]
     forms: list[FormItem] = []
     is_fallback: bool
+    latency_ms: int
+    # null khi AI không xác định được 1 thủ tục cụ thể (vd câu hỏi mơ hồ,
+    # query general). FE chỉ render chip khi field này có giá trị.
+    procedure_focus: ProcedureFocus | None = None
+
+
+class SectionRequest(BaseModel):
+    """
+    User click chip → request content cho 1 section của thủ tục đã chọn.
+    Append vào session hiện tại như 1 assistant message mới.
+    """
+    session_id: str | None = None
+    procedure_code: str = Field(..., min_length=1, max_length=20)
+    section_type: str = Field(..., min_length=1, max_length=30)
+
+
+class SectionResponse(BaseModel):
+    """Response cho 1 chip click. Content được persist vào DB như assistant msg."""
+    answer: str
+    session_id: str
+    message_id: str
+    forms: list[FormItem] = []
+    procedure_code: str
+    section_type: str
     latency_ms: int
 
 
@@ -74,6 +127,9 @@ class MessageResponse(BaseModel):
     # Forms re-derived từ audit (RAGGenerationLog → RAGRetrieval → ProcedureRequirement)
     # khi load session history → giữ nút "Tải về" sau khi navigate đi/về.
     forms: list["FormItem"] = []
+    # Cùng lý do với forms: re-derive chip để giữ tương tác sau navigate
+    # (TOP-1 procedure tại lúc generate). Null nếu message không phải intro.
+    procedure_focus: ProcedureFocus | None = None
 
     model_config = {"from_attributes": True}
 

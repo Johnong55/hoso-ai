@@ -24,6 +24,11 @@ from app.schemas.chat import (
     CreateSessionRequest,
     FormItem,
     MessageResponse,
+    ProcedureFocus,
+    RelatedProcedure,
+    SECTION_TYPES,
+    SectionRequest,
+    SectionResponse,
     SessionHistoryResponse,
     SessionResponse,
     SourceItem,
@@ -249,9 +254,11 @@ class ChatService:
             )
             sources = self._build_sources(result.chunks)
             forms = await self._build_forms(result.chunks, answer_text=result.answer)
+            focus = await self._build_procedure_focus(result.chunks, result.answer)
             logger.info(
                 f"Chat | ask | GUEST (no persist) | history={len(history)} "
-                f"| fallback={result.is_fallback} | latency={result.latency_ms}ms"
+                f"| fallback={result.is_fallback} | latency={result.latency_ms}ms "
+                f"| focus={focus.code if focus else None}"
             )
             return AskResponse(
                 answer=result.answer,
@@ -261,6 +268,7 @@ class ChatService:
                 forms=forms,
                 is_fallback=result.is_fallback,
                 latency_ms=result.latency_ms,
+                procedure_focus=focus,
             )
 
         # ── Authenticated flow: persist như cũ ────────────────────────────────
@@ -320,9 +328,11 @@ class ChatService:
 
         sources = self._build_sources(result.chunks)
         forms = await self._build_forms(result.chunks, answer_text=result.answer)
+        focus = await self._build_procedure_focus(result.chunks, result.answer)
         logger.info(
             f"Chat | ask | session_id={session.id} | user_id={user.id} "
-            f"| fallback={result.is_fallback} | latency={result.latency_ms}ms | forms={len(forms)}"
+            f"| fallback={result.is_fallback} | latency={result.latency_ms}ms "
+            f"| forms={len(forms)} | focus={focus.code if focus else None}"
         )
 
         return AskResponse(
@@ -333,6 +343,7 @@ class ChatService:
             forms=forms,
             is_fallback=result.is_fallback,
             latency_ms=result.latency_ms,
+            procedure_focus=focus,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -527,3 +538,347 @@ class ChatService:
                 score=round(chunk.score, 4),
             ))
         return sources
+
+    # ── Procedure focus + chip section ────────────────────────────────────────
+
+    # Gap nhỏ để phân biệt "thủ tục liên quan" với "không liên quan" cho chip
+    # "Xem thủ tục khác" — tránh show chip với procedure score quá thấp.
+    _RELATED_SCORE_GAP = 0.08
+    _MAX_RELATED = 3
+
+    async def _build_procedure_focus(
+        self,
+        chunks: list[RetrievedChunk],
+        answer_text: str | None,
+    ) -> ProcedureFocus | None:
+        """
+        Xác định TOP-1 procedure (ưu tiên LLM đã cite) → fetch metadata +
+        adaptive chip list dựa trên dữ liệu thực sự có. Trả None nếu không
+        có procedure nào đủ tin cậy → FE không render chip.
+        """
+        from app.models.procedure import (
+            Procedure, ProcedureFee, ProcedureRequirement, ProcedureStep,
+        )
+
+        if not chunks:
+            return None
+
+        # Best score per procedure
+        best_score: dict[str, float] = {}
+        name_by_code: dict[str, str] = {}
+        for c in chunks:
+            code = c.metadata.get("procedure_code")
+            if not code:
+                continue
+            if code not in best_score or c.score > best_score[code]:
+                best_score[code] = c.score
+            if code not in name_by_code:
+                name_by_code[code] = c.metadata.get("procedure_name") or ""
+        if not best_score:
+            return None
+
+        # Ưu tiên procedure được LLM cite trong answer; nếu không cite → score top
+        cited = self._extract_cited_codes(answer_text, chunks)
+        if cited:
+            top_code = max(
+                cited,
+                key=lambda c: best_score.get(c, 0.0),
+            )
+        else:
+            top_code = max(best_score, key=lambda c: best_score[c])
+
+        # Lookup procedure đầy đủ
+        proc = (await self._db.execute(
+            select(Procedure).where(Procedure.code == top_code)
+        )).scalar_one_or_none()
+        if not proc:
+            return None
+
+        # Adaptive chip — chỉ show chip nếu DB có data section đó
+        chips: list[str] = []
+        # steps
+        has_steps = (await self._db.execute(
+            select(func.count()).select_from(ProcedureStep).where(
+                ProcedureStep.procedure_id == proc.id
+            )
+        )).scalar() or 0
+        if has_steps:
+            chips.append("steps")
+        # requirements
+        has_reqs = (await self._db.execute(
+            select(func.count()).select_from(ProcedureRequirement).where(
+                ProcedureRequirement.procedure_id == proc.id
+            )
+        )).scalar() or 0
+        if has_reqs:
+            chips.append("requirements")
+        # fees (chip dùng cho cả fee + processing_time)
+        has_fees = (await self._db.execute(
+            select(func.count()).select_from(ProcedureFee).where(
+                ProcedureFee.procedure_id == proc.id
+            )
+        )).scalar() or 0
+        if has_fees or proc.fee or proc.processing_time:
+            chips.append("fees")
+        # agency luôn có (implementing_agency hoặc authority)
+        if proc.implementing_agency or proc.authority:
+            chips.append("agency")
+        # forms: chỉ có khi requirement nào có form_url
+        has_forms = (await self._db.execute(
+            select(func.count()).select_from(ProcedureRequirement).where(
+                ProcedureRequirement.procedure_id == proc.id,
+                ProcedureRequirement.form_url.is_not(None),
+            )
+        )).scalar() or 0
+        if has_forms:
+            chips.append("forms")
+
+        # Related procedures cho chip "Xem thủ tục khác"
+        related_codes = sorted(
+            [c for c in best_score if c != top_code],
+            key=lambda c: -best_score[c],
+        )
+        top_score = best_score[top_code]
+        related_codes = [
+            c for c in related_codes
+            if best_score[c] >= top_score - self._RELATED_SCORE_GAP
+        ][: self._MAX_RELATED]
+
+        related: list[RelatedProcedure] = []
+        if related_codes:
+            related_rows = (await self._db.execute(
+                select(Procedure.code, Procedure.name).where(
+                    Procedure.code.in_(related_codes)
+                )
+            )).all()
+            related = [
+                RelatedProcedure(code=code, name=name)
+                for code, name in related_rows
+            ]
+            if related:
+                chips.append("other_procedures")
+
+        return ProcedureFocus(
+            code=proc.code,
+            name=proc.name,
+            available_chips=chips,
+            related=related,
+        )
+
+    # ── Section: trả lời 1 chip ───────────────────────────────────────────────
+
+    async def request_section(
+        self,
+        payload: SectionRequest,
+        user: User | None,
+    ) -> SectionResponse:
+        """
+        User click 1 chip → format section đó cho procedure đã chọn → append
+        message AI mới vào session hiện tại. Section đi qua LLM với prompt
+        focused (không phải full RAG pipeline) → nhanh + consistent.
+        """
+        import time
+        from app.models.procedure import (
+            Procedure, ProcedureFee, ProcedureRequirement, ProcedureStep,
+        )
+
+        start = time.monotonic()
+        section_type = payload.section_type.strip()
+        if section_type not in SECTION_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"section_type không hợp lệ. Cho phép: {list(SECTION_TYPES)}",
+            )
+
+        # Lookup procedure
+        proc = (await self._db.execute(
+            select(Procedure).where(Procedure.code == payload.procedure_code.strip())
+        )).scalar_one_or_none()
+        if not proc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Không tìm thấy thủ tục mã {payload.procedure_code}.",
+            )
+
+        # Build raw_data theo section type
+        raw_data = await self._build_section_raw_data(
+            section_type, proc, payload.procedure_code
+        )
+        if not raw_data:
+            answer = f"Thủ tục này chưa có dữ liệu mục '{SECTION_TYPES[section_type]}'."
+            section_forms: list[FormItem] = []
+        else:
+            # Gọi LLM format
+            gen = _pipeline._generator.generate_section(
+                section_type=section_type,
+                procedure_name=proc.name,
+                procedure_code=proc.code,
+                raw_data=raw_data,
+            )
+            answer = gen.answer
+            section_forms = []
+            # forms chip: đính kèm FormItem objects để FE render nút Tải về
+            if section_type == "forms":
+                req_rows = (await self._db.execute(
+                    select(
+                        ProcedureRequirement.name,
+                        ProcedureRequirement.form_name,
+                        ProcedureRequirement.form_url,
+                    ).where(
+                        ProcedureRequirement.procedure_id == proc.id,
+                        ProcedureRequirement.form_url.is_not(None),
+                    )
+                )).all()
+                seen_urls: set[str] = set()
+                for name, fname, url in req_rows:
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    section_forms.append(FormItem(
+                        name=name, form_name=fname, url=url,
+                        procedure_code=proc.code,
+                        procedure_name=proc.name,
+                    ))
+
+        # Persist message
+        session_id = payload.session_id or ""
+        message_id = ""
+        if user is not None and session_id:
+            session = await self.get_session(session_id, user)
+            assistant_msg = Message(
+                session_id=session.id,
+                role=MessageRole.ASSISTANT,
+                content=answer,
+            )
+            self._db.add(assistant_msg)
+            await self._db.flush()
+            message_id = assistant_msg.id
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        logger.info(
+            f"Chat | section | code={proc.code} | type={section_type} "
+            f"| latency={elapsed_ms}ms | forms={len(section_forms)}"
+        )
+        return SectionResponse(
+            answer=answer,
+            session_id=session_id,
+            message_id=message_id,
+            forms=section_forms,
+            procedure_code=proc.code,
+            section_type=section_type,
+            latency_ms=elapsed_ms,
+        )
+
+    async def _build_section_raw_data(
+        self,
+        section_type: str,
+        proc,
+        procedure_code: str,
+    ) -> str:
+        """Fetch + format raw data cho 1 section type. Trả empty str nếu rỗng."""
+        from app.models.procedure import (
+            Procedure, ProcedureFee, ProcedureRequirement, ProcedureStep,
+        )
+
+        if section_type == "steps":
+            row = (await self._db.execute(
+                select(ProcedureStep.description).where(
+                    ProcedureStep.procedure_id == proc.id
+                ).order_by(ProcedureStep.step_order)
+            )).first()
+            return (row[0] or "").strip() if row else ""
+
+        if section_type == "requirements":
+            rows = (await self._db.execute(
+                select(ProcedureRequirement).where(
+                    ProcedureRequirement.procedure_id == proc.id
+                ).order_by(ProcedureRequirement.order)
+            )).scalars().all()
+            if not rows:
+                return ""
+            # Group by case_group
+            from collections import defaultdict
+            grouped: dict[str, list] = defaultdict(list)
+            for r in rows:
+                grouped[r.case_group or "Bao gồm"].append(r)
+            parts = []
+            for case, reqs in grouped.items():
+                parts.append(f"[Trường hợp / Loại giấy tờ: {case}]")
+                for r in reqs:
+                    line = f"- {r.name}"
+                    if r.quantity:
+                        line += f" ({r.quantity})"
+                    if r.form_name:
+                        line += f" | Mẫu: {r.form_name}"
+                    if r.is_mandatory is False:
+                        line += " (không bắt buộc)"
+                    parts.append(line)
+                parts.append("")
+            return "\n".join(parts).strip()
+
+        if section_type == "fees":
+            rows = (await self._db.execute(
+                select(ProcedureFee).where(
+                    ProcedureFee.procedure_id == proc.id
+                ).order_by(ProcedureFee.order)
+            )).scalars().all()
+            if not rows:
+                # fallback denorm fields
+                lines = []
+                if proc.processing_time:
+                    lines.append(f"Thời hạn giải quyết: {proc.processing_time}")
+                if proc.fee:
+                    lines.append(f"Lệ phí: {proc.fee}")
+                return "\n".join(lines)
+            parts = []
+            for r in rows:
+                line = f"- Phương thức: {r.submission_method}"
+                if r.processing_time:
+                    line += f" | Thời hạn: {r.processing_time}"
+                if r.amount_text:
+                    line += f" | Phí: {r.amount_text}"
+                else:
+                    line += " | Phí: (không quy định)"
+                parts.append(line)
+                if r.description:
+                    parts.append(f"  Áp dụng: {r.description}")
+            return "\n".join(parts)
+
+        if section_type == "agency":
+            lines = []
+            if proc.implementing_agency:
+                lines.append(f"Cơ quan thực hiện: {proc.implementing_agency}")
+            if proc.authority and proc.authority != proc.implementing_agency:
+                lines.append(f"Cơ quan có thẩm quyền: {proc.authority}")
+            if proc.coordinating_agency:
+                lines.append(f"Cơ quan phối hợp: {proc.coordinating_agency}")
+            if proc.authority_level:
+                lines.append(f"Cấp: {proc.authority_level}")
+            return "\n".join(lines)
+
+        if section_type == "forms":
+            rows = (await self._db.execute(
+                select(ProcedureRequirement).where(
+                    ProcedureRequirement.procedure_id == proc.id,
+                    ProcedureRequirement.form_url.is_not(None),
+                )
+            )).scalars().all()
+            if not rows:
+                return ""
+            seen: set[str] = set()
+            parts = []
+            for r in rows:
+                if r.form_url in seen:
+                    continue
+                seen.add(r.form_url)
+                line = f"- {r.name}"
+                if r.form_name:
+                    line += f" — file: {r.form_name}"
+                parts.append(line)
+            return "\n".join(parts)
+
+        if section_type == "other_procedures":
+            # Không cần LLM cho cái này — trả text trống để bypass
+            return ""
+
+        return ""

@@ -19,56 +19,82 @@ MODEL_FALLBACKS = [
 # Dedupe giữ thứ tự
 MODEL_FALLBACKS = list(dict.fromkeys(MODEL_FALLBACKS))
 
-SYSTEM_PROMPT = """Bạn là trợ lý AI chuyên về thủ tục hành chính Việt Nam.
+SYSTEM_PROMPT = """Bạn là trợ lý AI thủ tục hành chính Việt Nam — chế độ INTRO.
 
 NHIỆM VỤ:
-Giúp công dân hiểu cần làm thủ tục gì để giải quyết tình huống cụ thể của họ.
-Người dùng thường hỏi theo TÌNH HUỐNG ĐỜI THƯỜNG ("em bé sinh ở nước ngoài muốn có
-quốc tịch VN", "tôi mất sổ hộ khẩu", "muốn mua điện cho nhà mới"), KHÔNG phải tên
-thủ tục chính xác. Bạn cần MAP tình huống đó sang thủ tục phù hợp trong [NGỮ CẢNH].
+Người dùng hỏi theo tình huống đời thường ("em bé sinh ở nước ngoài muốn có quốc
+tịch VN", "tôi mất CCCD"...). Bạn cần:
+  1. MAP tình huống → 1 thủ tục PHÙ HỢP NHẤT trong [NGỮ CẢNH].
+  2. Trả lời NGẮN GỌN (3-5 câu, tối đa 100 từ) gồm:
+     - Tên đầy đủ thủ tục + mã (vd: "Cấp thẻ tạm trú cho người nước ngoài tại
+       Việt Nam tại Công an cấp tỉnh, mã 1.003460").
+     - 1-2 câu giải thích vì sao thủ tục này áp dụng cho tình huống của họ.
+     - 1 dòng dẫn: "Vui lòng chọn nội dung bạn muốn xem chi tiết bên dưới."
+  3. KHÔNG liệt kê bước thực hiện, không liệt kê giấy tờ, không liệt kê lệ phí
+     trong câu trả lời INTRO. Hệ thống sẽ hiển thị các CHIP cho user click để
+     xem từng phần chi tiết riêng — đỡ tốn token, đỡ tràn màn hình.
 
 QUY TẮC:
 1. CHỈ dùng thông tin trong [NGỮ CẢNH]. KHÔNG bịa đặt, không thêm kiến thức ngoài.
-2. Nếu [NGỮ CẢNH] có thủ tục PHÙ HỢP với tình huống người dùng (dù tên thủ tục
-   không khớp y nguyên với từ ngữ trong câu hỏi), HÃY DÙNG thủ tục đó để trả lời
-   một cách HỮU ÍCH:
-   - Nêu rõ TÊN ĐẦY ĐỦ của thủ tục áp dụng
-   - Giải thích vì sao thủ tục này áp dụng cho tình huống của họ
-   - Liệt kê hồ sơ / trình tự / lệ phí / cơ quan thực hiện (lấy từ ngữ cảnh)
-3. Khi [NGỮ CẢNH] có NHIỀU thủ tục liên quan:
-   - CHỌN 1 thủ tục KHỚP NHẤT với tình huống → trả lời CHI TIẾT thủ tục đó
-     (đầy đủ Bước 1-N, hồ sơ, lệ phí, cơ quan...).
-   - Các thủ tục liên quan KHÁC chỉ cần nêu cuối câu trả lời 1 dòng ngắn:
-     "Nếu tình huống của bạn là [X], có thể xem thêm: <tên + mã thủ tục>".
-   - KHÔNG list dài 2-3 thủ tục song song — sẽ vượt budget, user không
-     đọc hết.
-3b. KHI [NGỮ CẢNH] có chunk "Trình tự thực hiện (FULL — KHÔNG được rút gọn)":
-   PHẢI liệt kê NGUYÊN VĂN toàn bộ Bước 1, 2, 3, ... đến hết, kèm tất cả các
-   sub-bullet (mô tả phương thức nộp, vai trò cán bộ tiếp nhận, thời gian tiếp
-   nhận, cách trả kết quả...). KHÔNG được rút gọn, KHÔNG được merge, KHÔNG bỏ
-   sub-bullet nào. User cần biết đầy đủ quy trình thực tế.
-4. CHỈ trả lời "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu.
+2. Khi có nhiều thủ tục liên quan, chọn THỦ TỤC KHỚP NHẤT (top score) trả lời.
+   Các thủ tục khác đã có chip "Xem thủ tục khác" cho user click — không nhắc
+   trong text intro.
+3. CHỈ trả lời "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu.
    Vui lòng liên hệ cơ quan có thẩm quyền để được hỗ trợ." khi [NGỮ CẢNH] HOÀN
-   TOÀN không có thủ tục nào liên quan tới tình huống — đừng từ chối chỉ vì tên
-   thủ tục không khớp từng từ với câu hỏi.
-5. Luôn trích dẫn nguồn ở cuối câu trả lời theo định dạng:
-   `Nguồn: [Nguồn N] Thủ tục: <Tên đầy đủ> (mã: <X.XXXXXX>)`
-   Trong đó `<X.XXXXXX>` là mã thủ tục lấy trực tiếp từ [NGỮ CẢNH] (chunks
-   có metadata procedure_code). KHÔNG bịa mã. Nêu mã giúp hệ thống đính
-   đúng biểu mẫu của thủ tục được cite.
-6. Trả lời bằng tiếng Việt, rõ ràng, có cấu trúc bullet. Đoạn dẫn nhập có
-   thể ngắn, nhưng phần trình tự / thành phần hồ sơ / lệ phí phải ĐẦY ĐỦ
-   theo ngữ cảnh, không rút gọn.
+   TOÀN không có thủ tục nào liên quan.
+4. Trích dẫn cuối câu theo định dạng cố định:
+   `Nguồn: Thủ tục <tên đầy đủ> (mã: <X.XXXXXX>)`
+   Mã lấy literal từ metadata `[mã: ...]` trong [NGỮ CẢNH]. KHÔNG bịa mã.
+5. Trả lời bằng tiếng Việt, văn phong tự nhiên, không bullet trong intro.
 
-VÍ DỤ MAP TÌNH HUỐNG → THỦ TỤC:
-- "em bé sinh ở nước ngoài muốn có quốc tịch VN" → Thủ tục đăng ký khai sinh cho
-  trẻ em sinh ở nước ngoài và có quốc tịch Việt Nam (việc đăng ký khai sinh chính
-  là việc xác nhận quốc tịch VN cho trẻ).
-- "tôi muốn đăng ký mua điện sinh hoạt" → Cấp điện mới từ lưới điện hạ áp,
-  trường hợp "Khách hàng mua điện sinh hoạt".
-- "mất hộ chiếu khi đi nước ngoài" → các thủ tục liên quan cấp lại giấy tờ xuất
-  nhập cảnh / cấp giấy thông hành.
+VÍ DỤ INTRO ĐÚNG ĐỘ DÀI:
+> Để cấp thẻ tạm trú cho vợ/chồng người nước ngoài của công dân Việt Nam, thủ
+> tục phù hợp là Cấp thẻ tạm trú cho người nước ngoài tại Việt Nam tại Công an
+> cấp tỉnh (mã 1.003460). Cơ quan tiếp nhận là Phòng Quản lý xuất nhập cảnh
+> Công an cấp tỉnh nơi vợ bạn cư trú, áp dụng cho diện cá nhân bảo lãnh
+> người nước ngoài. Vui lòng chọn nội dung bạn muốn xem chi tiết bên dưới.
+> Nguồn: Thủ tục Cấp thẻ tạm trú cho người nước ngoài tại Việt Nam tại Công an
+> cấp tỉnh (mã: 1.003460).
 """
+
+# Prompt dùng khi user click 1 chip → format 1 section cụ thể
+SECTION_PROMPTS = {
+    "steps": (
+        "Bạn nhận được [DỮ LIỆU] là toàn bộ trình tự thực hiện của 1 thủ tục.\n"
+        "Hãy trình bày lại RÕ RÀNG theo bullet, GIỮ NGUYÊN ý nghĩa và đầy đủ\n"
+        "các Bước 1, 2, 3, ... đến hết. Không rút gọn, không bỏ sub-bullet nào.\n"
+        "Mỗi bước có thể có nhiều ý nhỏ — giữ nguyên cấu trúc lồng nhau."
+    ),
+    "requirements": (
+        "Bạn nhận được [DỮ LIỆU] là danh sách giấy tờ cần chuẩn bị cho 1 thủ tục,\n"
+        "đã được nhóm theo case_group (trường hợp áp dụng). Hãy:\n"
+        "  - Liệt kê đầy đủ từng giấy tờ trong từng nhóm.\n"
+        "  - Ghi rõ quantity (vd 'Bản chính: 1') nếu có.\n"
+        "  - Nếu có form_name + form_url → ghi: 'Mẫu: <form_name>' (frontend tự render link).\n"
+        "  - Đánh dấu (BẮT BUỘC) hoặc (không bắt buộc) tuỳ is_mandatory."
+    ),
+    "fees": (
+        "Bạn nhận được [DỮ LIỆU] là danh sách phí + thời hạn theo từng phương thức nộp.\n"
+        "Trình bày dưới dạng nhóm theo submission_method (Trực tiếp / Trực tuyến /\n"
+        "Dịch vụ bưu chính). Trong mỗi nhóm: nêu thời hạn + mức phí + mô tả áp dụng."
+    ),
+    "agency": (
+        "Bạn nhận được [DỮ LIỆU] về cơ quan thực hiện thủ tục. Trình bày ngắn gọn:\n"
+        "  - Cơ quan thực hiện chính.\n"
+        "  - Cơ quan phối hợp (nếu có).\n"
+        "  - Nơi nộp hồ sơ cụ thể (cấp tỉnh / cấp huyện / Trung ương).\n"
+        "  - Hướng dẫn tìm địa chỉ nếu có thông tin."
+    ),
+    "forms": (
+        "Bạn nhận được [DỮ LIỆU] là danh sách biểu mẫu tải về. Liệt kê từng biểu\n"
+        "mẫu kèm tên file. Frontend sẽ tự render nút tải. Không bịa thêm form."
+    ),
+    "other_procedures": (
+        "Bạn nhận được [DỮ LIỆU] là vài thủ tục liên quan (score gần với TOP-1).\n"
+        "Trình bày dạng list: tên + mã + 1 dòng phân biệt mỗi cái. Mời user hỏi\n"
+        "tiếp nếu muốn xem chi tiết thủ tục khác."
+    ),
+}
 
 FALLBACK_RESPONSE = (
     "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu thủ tục hành chính. "
@@ -154,6 +180,69 @@ class Generator:
             f"| chunks_used={len(chunks)}"
         )
 
+        return GenerationResult(
+            answer=answer,
+            is_fallback=False,
+            prompt_tokens=usage.prompt_tokens if usage else 0,
+            completion_tokens=usage.completion_tokens if usage else 0,
+            total_tokens=usage.total_tokens if usage else 0,
+            model=used_model,
+        )
+
+    def generate_section(
+        self,
+        section_type: str,
+        procedure_name: str,
+        procedure_code: str,
+        raw_data: str,
+    ) -> GenerationResult:
+        """
+        Format 1 section cụ thể (steps/requirements/fees/agency/forms/other)
+        của thủ tục đã xác định. Backend caller chuẩn bị `raw_data` từ DB
+        (đã có sẵn structured) → LLM nhiệm vụ format lại đẹp + tự nhiên.
+        """
+        prompt = SECTION_PROMPTS.get(section_type)
+        if not prompt:
+            return GenerationResult(
+                answer=f"Loại nội dung '{section_type}' chưa được hỗ trợ.",
+                is_fallback=True,
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                model=settings.OPENAI_LLM_MODEL,
+            )
+
+        system = (
+            f"{prompt}\n\n"
+            "QUY TẮC CHUNG:\n"
+            "- CHỈ dùng [DỮ LIỆU], không bịa đặt.\n"
+            "- Văn phong tiếng Việt rõ ràng, bullet list khi liệt kê.\n"
+            "- KHÔNG thêm phần giới thiệu/kết luận dài dòng — đi thẳng nội dung.\n"
+            "- Không cite Nguồn ở cuối (đã có context bên trên trong UI)."
+        )
+        user_msg = (
+            f"[THỦ TỤC] {procedure_name} (mã: {procedure_code})\n\n"
+            f"[DỮ LIỆU]\n{raw_data}"
+        )
+        response, used_model = self._call_with_fallback(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=settings.LLM_MAX_TOKENS,
+        )
+        if response is None:
+            return GenerationResult(
+                answer="Không tải được nội dung này. Vui lòng thử lại.",
+                is_fallback=True,
+                prompt_tokens=0, completion_tokens=0, total_tokens=0,
+                model=used_model or settings.LLM_MODEL,
+            )
+        answer = response.choices[0].message.content or "Nội dung trống."
+        usage = response.usage
+        logger.info(
+            f"Generator | section={section_type} | model={used_model} "
+            f"| tokens={usage.total_tokens if usage else 0}"
+        )
         return GenerationResult(
             answer=answer,
             is_fallback=False,
