@@ -844,6 +844,13 @@ class ChatService:
         raw_data = await self._build_section_raw_data(
             section_type, proc, payload.procedure_code
         )
+
+        # Auto-extract câu hỏi gốc của user trong session → truyền vào LLM
+        # để filter case_group khớp tình huống. Vd user hỏi "thường trú khi
+        # thuê nhà" → section requirements chỉ show case_group "thuê, mượn,
+        # ở nhờ" thay vì dump tất cả 7-8 trường hợp.
+        user_context = await self._extract_original_user_query(payload.session_id)
+
         if not raw_data:
             answer = f"Thủ tục này chưa có dữ liệu mục '{SECTION_TYPES[section_type]}'."
             section_forms: list[FormItem] = []
@@ -854,6 +861,7 @@ class ChatService:
                 procedure_name=proc.name,
                 procedure_code=proc.code,
                 raw_data=raw_data,
+                user_context=user_context,
             )
             answer = gen.answer
             section_forms = []
@@ -947,6 +955,25 @@ class ChatService:
             latency_ms=elapsed_ms,
             is_reuse=is_reuse,
         )
+
+    async def _extract_original_user_query(self, session_id: str | None) -> str | None:
+        """
+        Trả về USER message gần nhất (KHÔNG phải chip click) trong session —
+        đây là câu hỏi nguyên gốc thể hiện tình huống của user. Truyền vào
+        section prompt để LLM filter case_group khớp.
+
+        None nếu guest/không có session/không tìm được.
+        """
+        if not session_id:
+            return None
+        row = (await self._db.execute(
+            select(Message.content).where(
+                Message.session_id == session_id,
+                Message.role == MessageRole.USER,
+                Message.section_type.is_(None),  # bỏ qua chip-click user msgs
+            ).order_by(Message.created_at.desc()).limit(1)
+        )).first()
+        return row[0] if row else None
 
     async def _build_section_raw_data(
         self,

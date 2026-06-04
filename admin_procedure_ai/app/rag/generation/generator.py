@@ -210,11 +210,15 @@ class Generator:
         procedure_name: str,
         procedure_code: str,
         raw_data: str,
+        user_context: str | None = None,
     ) -> GenerationResult:
         """
-        Format 1 section cụ thể (steps/requirements/fees/agency/forms/other)
-        của thủ tục đã xác định. Backend caller chuẩn bị `raw_data` từ DB
-        (đã có sẵn structured) → LLM nhiệm vụ format lại đẹp + tự nhiên.
+        Format 1 section cụ thể của thủ tục đã xác định.
+
+        `user_context` (câu hỏi gốc của user): nếu truyền, LLM filter các
+        case_group trong raw_data chỉ giữ phần khớp tình huống của user.
+        Vd thủ tục thường trú có 7 trường hợp, user chỉ hỏi về "thuê nhà"
+        → trả lời chỉ trường hợp "thuê, mượn, ở nhờ".
         """
         prompt = SECTION_PROMPTS.get(section_type)
         if not prompt:
@@ -225,6 +229,30 @@ class Generator:
                 model=settings.ACTIVE_LLM_MODEL,
             )
 
+        # Khi có user_context, thêm rule filter case_group khớp tình huống.
+        # Áp dụng mạnh nhất cho requirements + forms (nhiều case_group). Các
+        # section khác (steps/fees/agency) thường ít trường hợp → không cần.
+        filter_rule = ""
+        if user_context and section_type in ("requirements", "forms"):
+            filter_rule = (
+                "\n\n[TÌNH HUỐNG CỦA USER]\n"
+                f"{user_context}\n\n"
+                "QUY TẮC LỌC THEO TÌNH HUỐNG:\n"
+                "- Nếu [DỮ LIỆU] có nhiều trường hợp / case_group khác nhau\n"
+                "  (vd 'Trường hợp 1: ...', 'Trường hợp 2: ...'), CHỈ LIỆT KÊ\n"
+                "  trường hợp khớp với tình huống của user.\n"
+                "- Vd user hỏi 'thường trú khi thuê nhà' → chỉ giữ case_group\n"
+                "  về 'thuê, mượn, ở nhờ', bỏ qua 'sở hữu nhà', 'tôn giáo',\n"
+                "  'quân đội', v.v.\n"
+                "- Nếu KHÔNG XÁC ĐỊNH được tình huống user khớp với case_group\n"
+                "  nào → hiển thị 2-3 case_group khả dĩ NHẤT, kèm dòng:\n"
+                "  'Trường hợp của bạn cụ thể là gì? Bạn có thể nói rõ hơn để\n"
+                "  hệ thống lọc giấy tờ phù hợp.'\n"
+                "- Mở đầu câu trả lời nhắc lại tình huống ngắn gọn 1 câu\n"
+                "  (vd 'Với tình huống đăng ký thường trú khi thuê nhà...')\n"
+                "  rồi mới liệt kê giấy tờ — để user xác nhận filter đúng."
+            )
+
         system = (
             f"{prompt}\n\n"
             "QUY TẮC CHUNG:\n"
@@ -232,6 +260,7 @@ class Generator:
             "- Văn phong tiếng Việt rõ ràng, bullet list khi liệt kê.\n"
             "- KHÔNG thêm phần giới thiệu/kết luận dài dòng — đi thẳng nội dung.\n"
             "- Không cite Nguồn ở cuối (đã có context bên trên trong UI)."
+            f"{filter_rule}"
         )
         user_msg = (
             f"[THỦ TỤC] {procedure_name} (mã: {procedure_code})\n\n"
