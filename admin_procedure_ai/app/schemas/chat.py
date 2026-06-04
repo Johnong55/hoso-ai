@@ -68,6 +68,9 @@ class ProcedureFocus(BaseModel):
     name: str                                      # tên đầy đủ
     available_chips: list[str]                     # subset của SECTION_TYPES keys
     related: list[RelatedProcedure] = []           # thủ tục liên quan để chip "Xem thủ tục khác"
+    # URL Cổng DVCQG để user click → nộp trực tuyến. Null nếu thủ tục không
+    # hỗ trợ submission ONLINE hoặc chưa có formality_id (data cũ).
+    online_submission_url: str | None = None
 
 
 class AskResponse(BaseModel):

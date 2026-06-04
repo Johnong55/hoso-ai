@@ -324,11 +324,14 @@ class ChatService:
             if related:
                 chips.append("other_procedures")
 
+            online_url = await self._build_online_submission_url(proc)
+
             out[msg_id] = ProcedureFocus(
                 code=proc.code,
                 name=proc.name,
                 available_chips=chips,
                 related=related,
+                online_submission_url=online_url,
             )
         return out
 
@@ -652,6 +655,34 @@ class ChatService:
     _RELATED_SCORE_GAP = 0.08
     _MAX_RELATED = 3
 
+    # Template URL nộp trực tuyến (chỉ cần formalityId, các param khác là filter
+    # location/agency optional; nếu thiếu thì DVCQG hỏi user chọn).
+    _DVCQG_SUBMIT_URL = (
+        "https://dichvucong.gov.vn/tim-kiem-thu-tuc-hanh-chinh?formalityId={fid}"
+    )
+
+    @staticmethod
+    def _has_online_submission(fees: list) -> bool:
+        """True nếu ProcedureFee.submission_method nào contains 'Trực tuyến'."""
+        for f in fees:
+            method = (f.submission_method or "").lower()
+            if "trực tuyến" in method or "online" in method:
+                return True
+        return False
+
+    async def _build_online_submission_url(self, proc) -> str | None:
+        """Build URL nộp trực tuyến nếu procedure có method ONLINE + có formality_id."""
+        from app.models.procedure import ProcedureFee
+
+        if not proc.formality_id:
+            return None
+        fees = (await self._db.execute(
+            select(ProcedureFee).where(ProcedureFee.procedure_id == proc.id)
+        )).scalars().all()
+        if not self._has_online_submission(fees):
+            return None
+        return self._DVCQG_SUBMIT_URL.format(fid=proc.formality_id)
+
     async def _build_procedure_focus(
         self,
         chunks: list[RetrievedChunk],
@@ -764,11 +795,14 @@ class ChatService:
             if related:
                 chips.append("other_procedures")
 
+        online_url = await self._build_online_submission_url(proc)
+
         return ProcedureFocus(
             code=proc.code,
             name=proc.name,
             available_chips=chips,
             related=related,
+            online_submission_url=online_url,
         )
 
     # ── Section: trả lời 1 chip ───────────────────────────────────────────────

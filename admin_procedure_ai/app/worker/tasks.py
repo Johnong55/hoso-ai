@@ -232,6 +232,7 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
             fee_summary = (parsed.get("fee_summary") or "")[:500] or None
             proc_time = (parsed.get("processing_time") or "")[:200] or None
 
+            formality_id = (parsed.get("source_id") or "").strip() or None
             if existing:
                 procedure = existing
                 procedure.name = safe_name
@@ -244,6 +245,8 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                 procedure.result = parsed.get("result")
                 procedure.legal_basis = parsed.get("legal_basis")
                 procedure.status = ProcedureStatus.ACTIVE
+                if formality_id:
+                    procedure.formality_id = formality_id
             else:
                 procedure = Procedure(
                     code=code,
@@ -257,6 +260,7 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
                     legal_basis=parsed.get("legal_basis"),
                     authority_level=AuthorityLevel.CENTRAL,
                     status=ProcedureStatus.ACTIVE,
+                    formality_id=formality_id,
                 )
                 db.add(procedure)
 

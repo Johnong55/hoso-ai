@@ -74,6 +74,10 @@ class Procedure(Base):
     # với DB, không phải tải full detail mới biết có thay đổi hay không.
     source_updated_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
 
+    # UUID gốc của thủ tục bên DVCQG (field `data.id` từ API detail). Dùng
+    # build URL nộp trực tuyến: dichvucong.gov.vn/...?formalityId=<UUID>
+    formality_id: Mapped[str | None] = mapped_column(String(40), index=True)
+
     status: Mapped[str] = mapped_column(
         Enum(ProcedureStatus, values_callable=lambda x: [e.value for e in x]),
         default=ProcedureStatus.DRAFT,
