@@ -215,16 +215,122 @@ class ChatService:
                     if out:
                         forms_by_msg[msg_id] = out
 
+        # Re-derive procedure_focus cho mỗi assistant intro message — để chip
+        # vẫn hiện sau navigate / reload. Chỉ cho message KHÔNG phải section
+        # (section messages không có chip riêng).
+        focus_by_msg = await self._rederive_focus_for_history(
+            messages, top_codes_by_msg if assistant_ids else {}
+        )
+
         msg_responses: list[MessageResponse] = []
         for m in messages:
             resp = MessageResponse.model_validate(m)
             resp.forms = forms_by_msg.get(m.id, [])
+            resp.procedure_focus = focus_by_msg.get(m.id)
             msg_responses.append(resp)
 
         return SessionHistoryResponse(
             session=SessionResponse.model_validate(session),
             messages=msg_responses,
         )
+
+    async def _rederive_focus_for_history(
+        self,
+        messages: list[Message],
+        top_codes_by_msg: dict[str, set[str]],
+    ) -> dict[str, ProcedureFocus]:
+        """
+        Cho mỗi assistant intro message, build lại ProcedureFocus từ:
+        - TOP procedure_code = top score trong audit log (top_codes_by_msg).
+        - chips = adaptive theo data thực có trong DB.
+        - related = TOP-2, TOP-3 trong audit.
+
+        Heuristic phân biệt intro vs section: intro messages có chip
+        re-derive (có procedure_code TOP từ audit). Section messages
+        thường không có audit log (do request_section không gọi pipeline)
+        → sẽ không có procedure_code → bỏ qua.
+        """
+        from app.models.procedure import (
+            Procedure, ProcedureFee, ProcedureRequirement, ProcedureStep,
+        )
+
+        out: dict[str, ProcedureFocus] = {}
+        if not top_codes_by_msg:
+            return out
+
+        # Tất cả unique codes cần lookup metadata
+        all_codes: set[str] = set()
+        for codes in top_codes_by_msg.values():
+            all_codes.update(codes)
+        if not all_codes:
+            return out
+
+        # Bulk lookup Procedure
+        proc_rows = (await self._db.execute(
+            select(Procedure).where(Procedure.code.in_(all_codes))
+        )).scalars().all()
+        proc_by_code = {p.code: p for p in proc_rows}
+
+        # Bulk count: steps / requirements / fees / form-having-requirements
+        proc_ids = [p.id for p in proc_rows]
+        if not proc_ids:
+            return out
+
+        has_steps = {pid for (pid,) in (await self._db.execute(
+            select(ProcedureStep.procedure_id).where(ProcedureStep.procedure_id.in_(proc_ids))
+        )).all()}
+        has_reqs = {pid for (pid,) in (await self._db.execute(
+            select(ProcedureRequirement.procedure_id).where(
+                ProcedureRequirement.procedure_id.in_(proc_ids)
+            )
+        )).all()}
+        has_fees = {pid for (pid,) in (await self._db.execute(
+            select(ProcedureFee.procedure_id).where(ProcedureFee.procedure_id.in_(proc_ids))
+        )).all()}
+        has_forms = {pid for (pid,) in (await self._db.execute(
+            select(ProcedureRequirement.procedure_id).where(
+                ProcedureRequirement.procedure_id.in_(proc_ids),
+                ProcedureRequirement.form_url.is_not(None),
+            )
+        )).all()}
+
+        # Build focus per message
+        for msg_id, codes in top_codes_by_msg.items():
+            if not codes:
+                continue
+            # codes là set — TOP-1 lấy được nhờ message content có cite literal mã
+            # hoặc score order đã sorted. Lấy procedure_code đầu tiên có trong DB.
+            top_code = next((c for c in codes if c in proc_by_code), None)
+            if not top_code:
+                continue
+            proc = proc_by_code[top_code]
+            chips: list[str] = []
+            if proc.id in has_steps:
+                chips.append("steps")
+            if proc.id in has_reqs:
+                chips.append("requirements")
+            if proc.id in has_fees or proc.fee or proc.processing_time:
+                chips.append("fees")
+            if proc.implementing_agency or proc.authority:
+                chips.append("agency")
+            if proc.id in has_forms:
+                chips.append("forms")
+
+            related = [
+                RelatedProcedure(code=c, name=proc_by_code[c].name)
+                for c in codes
+                if c != top_code and c in proc_by_code
+            ][: self._MAX_RELATED]
+            if related:
+                chips.append("other_procedures")
+
+            out[msg_id] = ProcedureFocus(
+                code=proc.code,
+                name=proc.name,
+                available_chips=chips,
+                related=related,
+            )
+        return out
 
     async def delete_session(self, session_id: str, user: User) -> None:
         session = await self.get_session(session_id, user)
