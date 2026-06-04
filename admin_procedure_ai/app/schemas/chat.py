@@ -97,14 +97,21 @@ class SectionRequest(BaseModel):
 
 
 class SectionResponse(BaseModel):
-    """Response cho 1 chip click. Content được persist vào DB như assistant msg."""
+    """
+    Response cho 1 chip click. Content được persist vào DB như assistant msg
+    + user msg (label chip) để chat trông như hội thoại thật + verify chip
+    đã click sau reload.
+    """
     answer: str
     session_id: str
-    message_id: str
+    message_id: str                       # ID assistant message
+    user_message_id: str = ""             # ID user "click chip" message (rỗng nếu guest/reuse)
+    chip_label: str = ""                  # Label hiển thị cho user msg (vd "Giấy tờ cần chuẩn bị")
     forms: list[FormItem] = []
     procedure_code: str
     section_type: str
     latency_ms: int
+    is_reuse: bool = False                # True nếu idempotent — chip đã click trước
 
 
 class SessionResponse(BaseModel):
@@ -133,6 +140,9 @@ class MessageResponse(BaseModel):
     # Cùng lý do với forms: re-derive chip để giữ tương tác sau navigate
     # (TOP-1 procedure tại lúc generate). Null nếu message không phải intro.
     procedure_focus: ProcedureFocus | None = None
+    # Persisted từ DB (column messages.section_type). Set khi message sinh
+    # từ click chip — dùng để FE verify chip đã click sau reload.
+    section_type: str | None = None
 
     model_config = {"from_attributes": True}
 

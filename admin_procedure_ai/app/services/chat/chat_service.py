@@ -880,33 +880,72 @@ class ChatService:
                         procedure_name=proc.name,
                     ))
 
-        # Persist message
+        # Persist 2 messages: USER (label chip) + ASSISTANT (nội dung section).
+        # Cả 2 cùng section_type để pair lại sau khi reload + verify chip đã click.
         session_id = payload.session_id or ""
         message_id = ""
+        user_message_id = ""
+        chip_label = SECTION_TYPES.get(section_type, section_type)
         if user is not None and session_id:
             session = await self.get_session(session_id, user)
-            assistant_msg = Message(
-                session_id=session.id,
-                role=MessageRole.ASSISTANT,
-                content=answer,
-            )
-            self._db.add(assistant_msg)
-            await self._db.flush()
-            message_id = assistant_msg.id
+            # Idempotent: nếu user đã click chip này rồi (có message section_type
+            # cùng giá trị trong session), trả lại assistant message cũ → tránh
+            # nội dung khác nhau khi click 2 lần (LLM non-deterministic).
+            existing = (await self._db.execute(
+                select(Message).where(
+                    Message.session_id == session.id,
+                    Message.section_type == section_type,
+                    Message.role == MessageRole.ASSISTANT,
+                ).order_by(Message.created_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            if existing:
+                logger.info(
+                    f"Chat | section idempotent | code={proc.code} "
+                    f"| type={section_type} | reuse msg_id={existing.id}"
+                )
+                # Vẫn cần trả về section_forms khớp + answer = nội dung đã lưu
+                answer = existing.content
+                message_id = existing.id
+                # Skip insert thêm message
+            else:
+                user_chip_msg = Message(
+                    session_id=session.id,
+                    role=MessageRole.USER,
+                    content=chip_label,
+                    section_type=section_type,
+                )
+                self._db.add(user_chip_msg)
+                await self._db.flush()
+                user_message_id = user_chip_msg.id
+
+                assistant_msg = Message(
+                    session_id=session.id,
+                    role=MessageRole.ASSISTANT,
+                    content=answer,
+                    section_type=section_type,
+                )
+                self._db.add(assistant_msg)
+                await self._db.flush()
+                message_id = assistant_msg.id
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
+        is_reuse = bool(message_id and not user_message_id and user is not None)
         logger.info(
             f"Chat | section | code={proc.code} | type={section_type} "
-            f"| latency={elapsed_ms}ms | forms={len(section_forms)}"
+            f"| latency={elapsed_ms}ms | forms={len(section_forms)} "
+            f"| reuse={is_reuse}"
         )
         return SectionResponse(
             answer=answer,
             session_id=session_id,
             message_id=message_id,
+            user_message_id=user_message_id,
+            chip_label=chip_label,
             forms=section_forms,
             procedure_code=proc.code,
             section_type=section_type,
             latency_ms=elapsed_ms,
+            is_reuse=is_reuse,
         )
 
     async def _build_section_raw_data(
