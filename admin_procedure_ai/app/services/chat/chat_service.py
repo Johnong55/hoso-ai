@@ -113,10 +113,17 @@ class ChatService:
     ) -> SessionHistoryResponse:
         session = await self.get_session(session_id, user)
 
+        # Tiebreaker theo role để USER msg luôn đứng trước ASSISTANT khi 2 msg
+        # cùng timestamp. Note: 'a' < 'u' nên sort role text sai chiều — phải
+        # dùng CASE explicit: user=0, assistant=1.
+        import sqlalchemy as sa
         result = await self._db.execute(
             select(Message)
             .where(Message.session_id == session_id)
-            .order_by(Message.created_at)
+            .order_by(
+                Message.created_at,
+                sa.case((Message.role == MessageRole.USER, 0), else_=1),
+            )
         )
         messages = result.scalars().all()
 
@@ -840,22 +847,58 @@ class ChatService:
                 detail=f"Không tìm thấy thủ tục mã {payload.procedure_code}.",
             )
 
-        # Build raw_data theo section type
+        # Auto-extract câu hỏi gốc của user trong session → truyền vào LLM
+        # để filter case_group khớp tình huống.
+        user_context = await self._extract_original_user_query(payload.session_id)
+
+        session_id = payload.session_id or ""
+        message_id = ""
+        user_message_id = ""
+        chip_label = SECTION_TYPES.get(section_type, section_type)
+        existing = None
+
+        # ── 1. Insert USER chip-click message TRƯỚC khi gọi LLM ─────────────
+        # Lý do: created_at qua server NOW() có precision giây. Nếu 2 message
+        # cùng giây thì ORDER BY created_at trong history loader không stable
+        # → user msg đôi khi rớt xuống dưới assistant msg. Tách insert + flush
+        # NGAY để timestamp USER < ASSISTANT (cách nhau bởi 1-2s gọi LLM).
+        if user is not None and session_id:
+            session = await self.get_session(session_id, user)
+            existing = (await self._db.execute(
+                select(Message).where(
+                    Message.session_id == session.id,
+                    Message.section_type == section_type,
+                    Message.role == MessageRole.ASSISTANT,
+                ).order_by(Message.created_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            if not existing:
+                user_chip_msg = Message(
+                    session_id=session.id,
+                    role=MessageRole.USER,
+                    content=chip_label,
+                    section_type=section_type,
+                )
+                self._db.add(user_chip_msg)
+                await self._db.flush()
+                user_message_id = user_chip_msg.id
+
+        # ── 2. Build raw_data + gọi LLM (~1-2s) — tạo time gap với USER msg ──
         raw_data = await self._build_section_raw_data(
             section_type, proc, payload.procedure_code
         )
-
-        # Auto-extract câu hỏi gốc của user trong session → truyền vào LLM
-        # để filter case_group khớp tình huống. Vd user hỏi "thường trú khi
-        # thuê nhà" → section requirements chỉ show case_group "thuê, mượn,
-        # ở nhờ" thay vì dump tất cả 7-8 trường hợp.
-        user_context = await self._extract_original_user_query(payload.session_id)
-
-        if not raw_data:
-            answer = f"Thủ tục này chưa có dữ liệu mục '{SECTION_TYPES[section_type]}'."
+        if existing:
+            # Idempotent path — reuse nội dung cũ, không gọi LLM
+            logger.info(
+                f"Chat | section idempotent | code={proc.code} "
+                f"| type={section_type} | reuse msg_id={existing.id}"
+            )
+            answer = existing.content
+            message_id = existing.id
             section_forms: list[FormItem] = []
+        elif not raw_data:
+            answer = f"Thủ tục này chưa có dữ liệu mục '{SECTION_TYPES[section_type]}'."
+            section_forms = []
         else:
-            # Gọi LLM format
             gen = _pipeline._generator.generate_section(
                 section_type=section_type,
                 procedure_name=proc.name,
@@ -865,7 +908,6 @@ class ChatService:
             )
             answer = gen.answer
             section_forms = []
-            # forms chip: đính kèm FormItem objects để FE render nút Tải về
             if section_type == "forms":
                 req_rows = (await self._db.execute(
                     select(
@@ -888,53 +930,17 @@ class ChatService:
                         procedure_name=proc.name,
                     ))
 
-        # Persist 2 messages: USER (label chip) + ASSISTANT (nội dung section).
-        # Cả 2 cùng section_type để pair lại sau khi reload + verify chip đã click.
-        session_id = payload.session_id or ""
-        message_id = ""
-        user_message_id = ""
-        chip_label = SECTION_TYPES.get(section_type, section_type)
-        if user is not None and session_id:
-            session = await self.get_session(session_id, user)
-            # Idempotent: nếu user đã click chip này rồi (có message section_type
-            # cùng giá trị trong session), trả lại assistant message cũ → tránh
-            # nội dung khác nhau khi click 2 lần (LLM non-deterministic).
-            existing = (await self._db.execute(
-                select(Message).where(
-                    Message.session_id == session.id,
-                    Message.section_type == section_type,
-                    Message.role == MessageRole.ASSISTANT,
-                ).order_by(Message.created_at.desc()).limit(1)
-            )).scalar_one_or_none()
-            if existing:
-                logger.info(
-                    f"Chat | section idempotent | code={proc.code} "
-                    f"| type={section_type} | reuse msg_id={existing.id}"
-                )
-                # Vẫn cần trả về section_forms khớp + answer = nội dung đã lưu
-                answer = existing.content
-                message_id = existing.id
-                # Skip insert thêm message
-            else:
-                user_chip_msg = Message(
-                    session_id=session.id,
-                    role=MessageRole.USER,
-                    content=chip_label,
-                    section_type=section_type,
-                )
-                self._db.add(user_chip_msg)
-                await self._db.flush()
-                user_message_id = user_chip_msg.id
-
-                assistant_msg = Message(
-                    session_id=session.id,
-                    role=MessageRole.ASSISTANT,
-                    content=answer,
-                    section_type=section_type,
-                )
-                self._db.add(assistant_msg)
-                await self._db.flush()
-                message_id = assistant_msg.id
+        # ── 3. Insert ASSISTANT message sau khi đã có answer ─────────────────
+        if user is not None and session_id and not existing:
+            assistant_msg = Message(
+                session_id=session.id,
+                role=MessageRole.ASSISTANT,
+                content=answer,
+                section_type=section_type,
+            )
+            self._db.add(assistant_msg)
+            await self._db.flush()
+            message_id = assistant_msg.id
 
         elapsed_ms = int((time.monotonic() - start) * 1000)
         is_reuse = bool(message_id and not user_message_id and user is not None)
