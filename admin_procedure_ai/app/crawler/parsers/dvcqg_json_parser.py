@@ -214,7 +214,12 @@ def _flatten_requirements(execution_cases: list[dict[str, Any]]) -> list[dict[st
                 "form_url": form_url,
                 "quantity": quantity,
                 "document_type": (pc.get("code") or "").strip() or None,
-                "is_mandatory": bool(pc.get("required", True)),
+                # NOTE: API DVCQG trả `required: false` cho TẤT CẢ giấy tờ
+                # (kể cả những thứ rõ ràng bắt buộc như hộ chiếu, tờ khai).
+                # Field này không đáng tin → luôn set True. Trường hợp giấy
+                # tờ optional thực sự thường đã có "(nếu có)" / "hoặc" ngay
+                # trong name → user/LLM tự nhận diện được.
+                "is_mandatory": True,
                 "note": None,
             })
     return out

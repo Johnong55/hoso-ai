@@ -70,8 +70,9 @@ SECTION_PROMPTS = {
         "đã được nhóm theo case_group (trường hợp áp dụng). Hãy:\n"
         "  - Liệt kê đầy đủ từng giấy tờ trong từng nhóm.\n"
         "  - Ghi rõ quantity (vd 'Bản chính: 1') nếu có.\n"
-        "  - Nếu có form_name + form_url → ghi: 'Mẫu: <form_name>' (frontend tự render link).\n"
-        "  - Đánh dấu (BẮT BUỘC) hoặc (không bắt buộc) tuỳ is_mandatory."
+        "  - Nếu có form_name → ghi: 'Mẫu: <form_name>' (FE tự render link tải).\n"
+        "  - Giả định tất cả giấy tờ liệt kê ĐỀU bắt buộc, TRỪ KHI tên có chứa\n"
+        "    'nếu có', 'hoặc', 'tuỳ trường hợp' — khi đó nêu rõ điều kiện áp dụng."
     ),
     "fees": (
         "Bạn nhận được [DỮ LIỆU] là danh sách phí + thời hạn theo từng phương thức nộp.\n"

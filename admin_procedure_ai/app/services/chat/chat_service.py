@@ -916,8 +916,10 @@ class ChatService:
                         line += f" ({r.quantity})"
                     if r.form_name:
                         line += f" | Mẫu: {r.form_name}"
-                    if r.is_mandatory is False:
-                        line += " (không bắt buộc)"
+                    # NOTE: bỏ marker "(không bắt buộc)" — field is_mandatory
+                    # từ API DVCQG không đáng tin (trả false cho hết, kể cả hộ
+                    # chiếu). Trường hợp optional thực sự thường đã có
+                    # "(nếu có)" trong name → user/LLM tự nhận diện được.
                     parts.append(line)
                 parts.append("")
             return "\n".join(parts).strip()
