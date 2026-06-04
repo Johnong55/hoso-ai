@@ -7,17 +7,30 @@ from openai import OpenAI, APIStatusError
 from app.core.config import settings
 from app.rag.retrieval.retriever import RetrievedChunk
 
-# Fallback chain — khi model chính bị 503/429/404, tự thử model khác
-# Đã verify các model này tồn tại qua ListModels API (key user hiện tại)
-MODEL_FALLBACKS = [
-    settings.LLM_MODEL,        # Model chính từ .env
-    "gemini-2.0-flash",        # Stable, hiếm overload
-    "gemini-2.0-flash-lite",   # Lite version, gần như không overload
-    "gemini-2.5-flash-lite",   # Lite 2.5
-    "gemini-flash-latest",     # Always-latest pointer
-]
-# Dedupe giữ thứ tự
-MODEL_FALLBACKS = list(dict.fromkeys(MODEL_FALLBACKS))
+# Fallback chain — khi model chính bị 503/429/404, tự thử model khác.
+# Khác nhau theo provider vì namespace model khác hẳn.
+def _build_model_fallbacks() -> list[str]:
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "cloudflare":
+        chain = [
+            settings.ACTIVE_LLM_MODEL,                       # default từ env
+            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",      # quality, fast variant
+            "@cf/meta/llama-3.1-8b-instruct-fast",           # tốc độ cao
+            "@cf/meta/llama-3.1-8b-instruct",                # fallback regular
+        ]
+    else:
+        # OpenRouter / Gemini default chain
+        chain = [
+            settings.ACTIVE_LLM_MODEL,
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-flash-latest",
+        ]
+    return list(dict.fromkeys(chain))
+
+
+MODEL_FALLBACKS = _build_model_fallbacks()
 
 SYSTEM_PROMPT = """Bạn là trợ lý AI thủ tục hành chính Việt Nam — chế độ INTRO.
 
@@ -121,9 +134,10 @@ class Generator:
     """
 
     def __init__(self) -> None:
+        # Dùng ACTIVE_* để switch giữa OpenRouter / Cloudflare via LLM_PROVIDER.
         self._client = OpenAI(
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
+            api_key=settings.ACTIVE_LLM_API_KEY,
+            base_url=settings.ACTIVE_LLM_BASE_URL,
         )
 
     def generate(
@@ -138,7 +152,7 @@ class Generator:
                 prompt_tokens=0,
                 completion_tokens=0,
                 total_tokens=0,
-                model=settings.OPENAI_LLM_MODEL,
+                model=settings.ACTIVE_LLM_MODEL,
             )
 
         context = self._build_context(chunks)
@@ -161,7 +175,7 @@ class Generator:
                 prompt_tokens=0,
                 completion_tokens=0,
                 total_tokens=0,
-                model=used_model or settings.LLM_MODEL,
+                model=used_model or settings.ACTIVE_LLM_MODEL,
             )
 
         answer = response.choices[0].message.content or FALLBACK_RESPONSE
@@ -208,7 +222,7 @@ class Generator:
                 answer=f"Loại nội dung '{section_type}' chưa được hỗ trợ.",
                 is_fallback=True,
                 prompt_tokens=0, completion_tokens=0, total_tokens=0,
-                model=settings.OPENAI_LLM_MODEL,
+                model=settings.ACTIVE_LLM_MODEL,
             )
 
         system = (
@@ -236,7 +250,7 @@ class Generator:
                 answer="Không tải được nội dung này. Vui lòng thử lại.",
                 is_fallback=True,
                 prompt_tokens=0, completion_tokens=0, total_tokens=0,
-                model=used_model or settings.LLM_MODEL,
+                model=used_model or settings.ACTIVE_LLM_MODEL,
             )
         answer = response.choices[0].message.content or "Nội dung trống."
         usage = response.usage
@@ -343,8 +357,8 @@ class Generator:
                 if extra_body:
                     kwargs["extra_body"] = extra_body
                 response = self._client.chat.completions.create(**kwargs)
-                if model != settings.LLM_MODEL:
-                    logger.warning(f"Generator | fallback success | dùng {model} thay vì {settings.LLM_MODEL}")
+                if model != settings.ACTIVE_LLM_MODEL:
+                    logger.warning(f"Generator | fallback success | dùng {model} thay vì {settings.ACTIVE_LLM_MODEL}")
                 return response, model
             except APIStatusError as exc:
                 # Retry với: 503 (overload), 429 (rate limit), 500 (internal),

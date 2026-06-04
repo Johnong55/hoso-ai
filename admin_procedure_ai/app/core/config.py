@@ -70,15 +70,50 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
 
-    # ── LLM (Chat) — OpenRouter ───────────────────────────────────────────────
+    # ── LLM (Chat) ────────────────────────────────────────────────────────────
+    # Provider switch: "openrouter" (Gemini/Qwen qua proxy) hoặc "cloudflare"
+    # (Workers AI, nhanh + free tier thoáng).
+    LLM_PROVIDER: str = "openrouter"
+
+    # OpenRouter (Gemini/Qwen)
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_MODEL: str = "qwen/qwen3-6b:free"              # model sinh câu trả lời
+
+    # Cloudflare Workers AI (OpenAI-compat). Dùng chung CLOUDFLARE_ACCOUNT_ID +
+    # CLOUDFLARE_API_TOKEN với embedding. Model khuyến nghị:
+    #   - "@cf/meta/llama-3.3-70b-instruct-fp8-fast" — chất lượng tốt, ~2-4s
+    #   - "@cf/meta/llama-3.1-8b-instruct-fast" — rất nhanh ~0.5-1.5s, đôi
+    #     khi miss nuance VN. Đổi qua env nếu cần ưu tiên speed.
+    CLOUDFLARE_LLM_MODEL: str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+
     # Gemini 2.5 là thinking model → thinking tokens và output dùng CHUNG budget này.
     # Để đủ chỗ cho cả thinking (~1000-1500) lẫn output dài (vài Bước thực hiện),
-    # đặt 4000 trở lên. Gemini 2.5 Flash hỗ trợ tới 8192.
+    # đặt 4000 trở lên. Gemini 2.5 Flash hỗ trợ tới 8192. Llama không thinking
+    # → 4000 là dư dả cho output.
     LLM_MAX_TOKENS: int = 4000
     LLM_TEMPERATURE: float = 0.1
+
+    @property
+    def ACTIVE_LLM_BASE_URL(self) -> str:
+        if self.LLM_PROVIDER.lower() == "cloudflare":
+            return (
+                f"https://api.cloudflare.com/client/v4/accounts/"
+                f"{self.CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+            )
+        return self.LLM_BASE_URL
+
+    @property
+    def ACTIVE_LLM_API_KEY(self) -> str:
+        if self.LLM_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_API_TOKEN
+        return self.LLM_API_KEY
+
+    @property
+    def ACTIVE_LLM_MODEL(self) -> str:
+        if self.LLM_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_LLM_MODEL
+        return self.LLM_MODEL
 
     # ── Embedding (provider switch) ───────────────────────────────────────────
     # "gemini"     → Google gemini-embedding-001 (3072d), chất lượng tốt nhưng
