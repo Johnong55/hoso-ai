@@ -24,6 +24,14 @@ env/
 *.sqlite3
 chroma_data/
 chroma_db/
+qdrant_data/
+
+# TTHC xlsx data (copy local, don't commit)
+admin_procedure_ai/data/tthc/*.xlsx
+admin_procedure_ai/data/tthc/*.doc
+admin_procedure_ai/data/tthc/*.docx
+!admin_procedure_ai/data/tthc/.gitkeep
+!admin_procedure_ai/data/tthc/README.md
 
 # Logs
 logs/

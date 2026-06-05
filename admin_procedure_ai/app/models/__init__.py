@@ -8,6 +8,7 @@ from app.models.procedure import (  # noqa: F401
     Procedure,
     ProcedureRequirement,
     ProcedureStep,
+    ProcedureFee,
     ProcedureLocality,
     Locality,
     ProcedureStatus,

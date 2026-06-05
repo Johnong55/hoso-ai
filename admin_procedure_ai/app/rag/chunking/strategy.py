@@ -31,11 +31,15 @@ class ProcedureChunker:
 
     def chunk_procedure(self, procedure_data: dict[str, Any]) -> list[Chunk]:
         """
-        procedure_data keys expected:
+        procedure_data keys expected (sau khi parser docx mới):
           id, code, name, domain, authority_level, locality,
-          description, legal_basis, fee, result, processing_time,
-          requirements: [{name, form_name, quantity, document_type, note, is_mandatory, order}]
-          steps: [{order, title, description, responsible_party, duration}]
+          description, legal_basis, result, conditions,
+          requirements: [{name, form_name, quantity, case_group}]
+          fees:  [{submission_method, processing_time, amount_text, description}]
+          steps_text: str  -- toàn bộ trình tự, chunking bằng sliding window
+          # legacy compat:
+          steps: [{order, title, description, ...}]
+          fee, processing_time: str (denormalized summary)
         """
         base_meta = {
             "procedure_id": procedure_data.get("id"),
@@ -55,8 +59,52 @@ class ProcedureChunker:
                     metadata={**base_meta, "section": "Mô tả"},
                 ))
 
-        # Fee chunk
-        if procedure_data.get("fee") or procedure_data.get("processing_time"):
+        # Conditions chunk (Yêu cầu, điều kiện thực hiện)
+        if procedure_data.get("conditions"):
+            for chunk in self._split_text(procedure_data["conditions"]):
+                chunks.append(Chunk(
+                    content=f"Thủ tục: {procedure_data['name']}\nYêu cầu, điều kiện thực hiện: {chunk}",
+                    chunk_type=ChunkType.GENERAL,
+                    metadata={**base_meta, "section": "Yêu cầu, điều kiện"},
+                ))
+
+        # Fee chunks — 1 chunk per submission_method, gom hết các tier vào trong
+        # → user hỏi "phí nộp online bao nhiêu" sẽ retrieve được chunk Trực tuyến
+        # với đầy đủ các mức 5tr/10tr/0đ kèm trường hợp áp dụng
+        fees = procedure_data.get("fees") or []
+        if fees:
+            by_method: dict[str, list[dict]] = {}
+            for f in fees:
+                key = f.get("submission_method") or "Khác"
+                by_method.setdefault(key, []).append(f)
+
+            for method, tiers in by_method.items():
+                proc_time = next((t.get("processing_time") for t in tiers if t.get("processing_time")), None)
+                lines = [
+                    f"Thủ tục: {procedure_data['name']}",
+                    f"Phương thức nộp hồ sơ: {method}",
+                ]
+                if proc_time:
+                    lines.append(f"Thời hạn giải quyết: {proc_time}")
+                lines.append("Phí, lệ phí:")
+                for t in tiers:
+                    amt = t.get("amount_text") or "—"
+                    desc = t.get("description") or ""
+                    if desc:
+                        lines.append(f"- {amt}: {desc}")
+                    else:
+                        lines.append(f"- {amt}")
+                chunks.append(Chunk(
+                    content="\n".join(lines),
+                    chunk_type=ChunkType.FEE,
+                    metadata={
+                        **base_meta,
+                        "section": "Lệ phí & thời gian",
+                        "submission_method": method[:200],
+                    },
+                ))
+        elif procedure_data.get("fee") or procedure_data.get("processing_time"):
+            # Legacy fallback: 1 chunk gộp như cũ
             fee_text = f"Thủ tục: {procedure_data['name']}\n"
             if procedure_data.get("processing_time"):
                 fee_text += f"Thời gian xử lý: {procedure_data['processing_time']}\n"
@@ -84,14 +132,42 @@ class ProcedureChunker:
                 metadata={**base_meta, "section": "Căn cứ pháp lý"},
             ))
 
-        # One chunk per requirement — never split
+        # Group requirements by case_group → 1 chunk per group
+        # 4 nhóm chuẩn: "Bao gồm", "Giấy tờ phải nộp",
+        #                "Giấy tờ phải xuất trình", "Lưu ý"
+        # "Lưu ý" → chunk GENERAL riêng (hướng dẫn, không phải yêu cầu)
+        NOTE_GROUP = "Lưu ý"
+        req_groups: dict[str, list] = {}
         for req in procedure_data.get("requirements", []):
-            text = self._format_requirement(procedure_data["name"], req)
-            chunks.append(Chunk(
-                content=text,
-                chunk_type=ChunkType.REQUIREMENT,
-                metadata={**base_meta, "section": "Thành phần hồ sơ", "step_order": req.get("order")},
-            ))
+            key = req.get("case_group") or "Bao gồm"
+            req_groups.setdefault(key, []).append(req)
+
+        for case_group_key, reqs in req_groups.items():
+            if case_group_key == NOTE_GROUP:
+                # "Lưu ý" → GENERAL chunk (không phải danh sách giấy tờ)
+                text = self._format_note_group(procedure_data["name"], reqs)
+                chunks.append(Chunk(
+                    content=text,
+                    chunk_type=ChunkType.GENERAL,
+                    metadata={
+                        **base_meta,
+                        "section": "Lưu ý",
+                        "case_group": NOTE_GROUP,
+                    },
+                ))
+            else:
+                text = self._format_requirement_group(
+                    procedure_data["name"], case_group_key, reqs
+                )
+                chunks.append(Chunk(
+                    content=text,
+                    chunk_type=ChunkType.REQUIREMENT,
+                    metadata={
+                        **base_meta,
+                        "section": "Thành phần hồ sơ",   # luôn ngắn, tránh overflow VARCHAR(255)
+                        "case_group": case_group_key[:500],
+                    },
+                ))
 
         # Form chunks — mỗi biểu mẫu đã parse thành 1 chunk riêng
         for form_data in procedure_data.get("forms", []):
@@ -108,28 +184,92 @@ class ProcedureChunker:
                 },
             ))
 
-        # One chunk per step — never split
-        for step in procedure_data.get("steps", []):
-            text = self._format_step(procedure_data["name"], step)
-            chunks.append(Chunk(
-                content=text,
-                chunk_type=ChunkType.STEP,
-                metadata={**base_meta, "section": "Trình tự thực hiện", "step_order": step.get("order")},
-            ))
+        # Steps — gộp thành 1 blob, sliding window nếu dài
+        # Lý do bỏ tách per-step: cách hành văn không đồng nhất giữa các procedure
+        # (có cái "Bước 1/2/3", có cái viết thành paragraph liền). Để LLM tự đọc
+        # toàn bộ trình tự trong 1-2 chunks giúp giữ ngữ cảnh tốt hơn.
+        steps_text = procedure_data.get("steps_text") or ""
+        if not steps_text and procedure_data.get("steps"):
+            # Legacy fallback: gom field description của list steps
+            parts = []
+            for s in procedure_data["steps"]:
+                title = s.get("title") or f"Bước {s.get('order','?')}"
+                desc = s.get("description") or ""
+                parts.append(f"{title}: {desc}".strip())
+            steps_text = "\n".join(parts)
+
+        if steps_text:
+            sub_texts = self._split_text(steps_text)
+            for part_idx, sub_text in enumerate(sub_texts):
+                suffix = f" (phần {part_idx + 1}/{len(sub_texts)})" if len(sub_texts) > 1 else ""
+                content = (
+                    f"Thủ tục: {procedure_data['name']}\n"
+                    f"Trình tự thực hiện{suffix}:\n{sub_text}"
+                )
+                chunks.append(Chunk(
+                    content=content,
+                    chunk_type=ChunkType.STEP,
+                    metadata={
+                        **base_meta,
+                        "section": "Trình tự thực hiện",
+                        "part_index": part_idx,
+                    },
+                ))
 
         return chunks
 
-    def _format_requirement(self, procedure_name: str, req: dict) -> str:
-        lines = [f"Thủ tục: {procedure_name}", f"Thành phần hồ sơ: {req['name']}"]
-        if req.get("quantity"):
-            lines.append(f"Số lượng: {req['quantity']}")
-        if req.get("document_type"):
-            lines.append(f"Loại giấy tờ: {req['document_type']}")
-        if req.get("form_name"):
-            lines.append(f"Mẫu đơn: {req['form_name']}")
-        lines.append(f"Bắt buộc: {'Có' if req.get('is_mandatory', True) else 'Không'}")
-        if req.get("note"):
-            lines.append(f"Ghi chú: {req['note']}")
+    # Các nhóm "loại giấy tờ" chuẩn (không phải trường hợp cụ thể)
+    STANDARD_DOC_TYPES = {
+        "Bao gồm",
+        "Giấy tờ phải nộp",
+        "Giấy tờ phải xuất trình",
+    }
+
+    def _format_requirement_group(
+        self, procedure_name: str, case_group: str, reqs: list[dict]
+    ) -> str:
+        """
+        Có 2 loại case_group:
+        1. Loại giấy tờ chuẩn ("Bao gồm", "Giấy tờ phải nộp", "Giấy tờ phải xuất trình")
+           → format: "Thành phần hồ sơ (loại giấy tờ):\n1. ..."
+        2. Trường hợp cụ thể ("Đăng ký thường trú tại chỗ ở thuê mượn...", ...)
+           → format: "Trường hợp: [mô tả]\nGiấy tờ cần nộp:\n1. ..."
+           Đưa mô tả trường hợp vào đầu chunk để Gemini embed ngữ nghĩa đúng.
+        """
+        if case_group in self.STANDARD_DOC_TYPES:
+            labels = {
+                "Bao gồm":                   "Thành phần hồ sơ (biểu mẫu, giấy tờ cần nộp)",
+                "Giấy tờ phải nộp":          "Giấy tờ phải nộp kèm hồ sơ",
+                "Giấy tờ phải xuất trình":   "Giấy tờ phải xuất trình khi nộp hồ sơ",
+            }
+            lines = [
+                f"Thủ tục: {procedure_name}",
+                f"{labels[case_group]}:",
+            ]
+        else:
+            # Trường hợp cụ thể — đưa mô tả đầy đủ vào chunk để embedding khớp
+            # với câu hỏi người dùng mô tả tình huống của họ
+            lines = [
+                f"Thủ tục: {procedure_name}",
+                f"Trường hợp: {case_group}",
+                "Giấy tờ cần nộp:",
+            ]
+
+        for i, req in enumerate(reqs, 1):
+            entry = f"{i}. {req['name']}"
+            if req.get("quantity"):
+                entry += f" ({req['quantity']})"
+            if req.get("form_name"):
+                entry += f" — Mẫu: {req['form_name']}"
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def _format_note_group(self, procedure_name: str, reqs: list[dict]) -> str:
+        lines = [f"Thủ tục: {procedure_name}", "Lưu ý quan trọng khi thực hiện:"]
+        for req in reqs:
+            text = req.get("description") or req.get("name", "")
+            if text:
+                lines.append(f"- {text}")
         return "\n".join(lines)
 
     def _format_step(self, procedure_name: str, step: dict) -> str:

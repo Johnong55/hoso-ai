@@ -8,6 +8,8 @@ from app.schemas.chat import (
     AskRequest,
     AskResponse,
     CreateSessionRequest,
+    SectionRequest,
+    SectionResponse,
     SessionHistoryResponse,
     SessionResponse,
 )
@@ -29,6 +31,21 @@ async def ask(
     """
     service = ChatService(db)
     return await service.ask(payload, current_user)
+
+
+@router.post("/section", response_model=SectionResponse)
+async def request_section(
+    payload: SectionRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    User click 1 chip → backend format section đó cho thủ tục đã xác định.
+    Result append vào session hiện tại như 1 assistant message mới (nếu user
+    đã đăng nhập + có session_id). Guest dùng session local trên FE.
+    """
+    service = ChatService(db)
+    return await service.request_section(payload, current_user)
 
 
 @router.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)

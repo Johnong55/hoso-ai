@@ -42,6 +42,52 @@ class CrawlTriggerResponse(BaseModel):
     message: str
 
 
+# ── Crawl theo bộ/ngành (agency) hoặc theo mã thủ tục ──────────────────────────
+
+class AgencyItem(BaseModel):
+    """1 cơ quan (bộ/ngành) lấy từ API DVCQG."""
+    id: str
+    name: str
+    # `code` là `departmentCode` dùng server-side filter khi crawl (vd "G19", "D01").
+    # Luôn có giá trị từ endpoint /department/list-with-location.
+    code: str
+    level: str | None = None
+
+
+class CrawlAgencyRequest(BaseModel):
+    # `agency_code` là `departmentCode` (vd "G19") — backend dùng để filter
+    # server-side. Là field bắt buộc cho flow mới.
+    agency_code: str = Field(..., min_length=1, max_length=20)
+    agency_name: str | None = Field(None, max_length=300)
+
+
+class CrawlProcedureRequest(BaseModel):
+    # Mã TTHC dạng "1.015028", "2.000123"
+    code: str = Field(..., pattern=r"^\d+\.\d{4,}$")
+
+
+class CrawlByCodeResponse(BaseModel):
+    task_id: str
+    code: str
+    message: str
+
+
+class SourceProcedureItem(BaseModel):
+    """1 thủ tục trong drill-down của 1 source."""
+    code: str
+    name: str
+    domain: str | None = None
+    chunk_count: int = 0
+    updated_at: datetime | None = None
+
+
+class SourceProceduresResponse(BaseModel):
+    items: list[SourceProcedureItem]
+    total: int
+    page: int
+    page_size: int
+
+
 class RAGStatsResponse(BaseModel):
     total_procedures: int
     total_chunks: int

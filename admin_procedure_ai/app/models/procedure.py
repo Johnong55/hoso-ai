@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Boolean, Date, DateTime, Enum, ForeignKey, Integer,
+    BigInteger, Boolean, Date, DateTime, Enum, ForeignKey, Integer,
     String, Text, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -64,6 +64,20 @@ class Procedure(Base):
     fee: Mapped[str | None] = mapped_column(String(500))
     result: Mapped[str | None] = mapped_column(Text)
 
+    # SHA256 hex của parsed content (steps + fees + requirements + ...)
+    # Dùng cho change detection: nếu hash giống lần crawl trước → SKIP re-embed,
+    # tiết kiệm quota embedding API.
+    content_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+
+    # `updatedAt` (epoch milliseconds) lấy trực tiếp từ JSON API DVCQG.
+    # Ưu tiên dùng field này cho change detection: chỉ cần list-all rồi so sánh
+    # với DB, không phải tải full detail mới biết có thay đổi hay không.
+    source_updated_at: Mapped[int | None] = mapped_column(BigInteger, index=True)
+
+    # UUID gốc của thủ tục bên DVCQG (field `data.id` từ API detail). Dùng
+    # build URL nộp trực tuyến: dichvucong.gov.vn/...?formalityId=<UUID>
+    formality_id: Mapped[str | None] = mapped_column(String(40), index=True)
+
     status: Mapped[str] = mapped_column(
         Enum(ProcedureStatus, values_callable=lambda x: [e.value for e in x]),
         default=ProcedureStatus.DRAFT,
@@ -88,6 +102,12 @@ class Procedure(Base):
         order_by="ProcedureStep.step_order",
         lazy="noload",
     )
+    fees: Mapped[list["ProcedureFee"]] = relationship(
+        back_populates="procedure",
+        cascade="all, delete-orphan",
+        order_by="ProcedureFee.order",
+        lazy="noload",
+    )
     localities: Mapped[list["ProcedureLocality"]] = relationship(
         back_populates="procedure", cascade="all, delete-orphan", lazy="noload"
     )
@@ -109,6 +129,9 @@ class ProcedureRequirement(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # DD: description — mô tả chi tiết (bản gốc/sao, công chứng, số lượng...)
     description: Mapped[str | None] = mapped_column(Text)
+    # Tên trường hợp hồ sơ (ví dụ: "Đăng ký tại chỗ ở thuê, mượn, ở nhờ")
+    # Dùng để group requirements khi chunking → tránh 28 chunks giống nhau
+    case_group: Mapped[str | None] = mapped_column(String(500))
     # Các field bổ sung hữu ích (không có trong DD nhưng crawler cần)
     form_name: Mapped[str | None] = mapped_column(String(300))
     form_url: Mapped[str | None] = mapped_column(Text)      # link tải biểu mẫu
@@ -135,6 +158,33 @@ class ProcedureStep(Base):
     duration: Mapped[str | None] = mapped_column(String(100))
 
     procedure: Mapped["Procedure"] = relationship(back_populates="steps", lazy="noload")
+
+
+class ProcedureFee(Base):
+    """
+    Phí/lệ phí của thủ tục theo từng phương thức nộp hồ sơ.
+    Một procedure thường có nhiều tier:
+      - Trực tiếp / Trực tuyến / Dịch vụ bưu chính
+      - Mỗi phương thức lại có nhiều mức (vd: 0đ, 5tr, 10tr tuỳ trường hợp)
+    """
+    __tablename__ = "procedure_fees"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    procedure_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("procedures.id"), nullable=False, index=True
+    )
+
+    # "Trực tiếp" | "Trực tuyến" | "Dịch vụ bưu chính" | ...
+    submission_method: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # "30 Ngày" | "07 Ngày làm việc" | ...
+    processing_time: Mapped[str | None] = mapped_column(String(200))
+    # "5 triệu Đồng" | "0 Đồng" | "Miễn phí"
+    amount_text: Mapped[str | None] = mapped_column(String(300))
+    # Mô tả trường hợp áp dụng mức phí này
+    description: Mapped[str | None] = mapped_column(Text)
+    order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    procedure: Mapped["Procedure"] = relationship(back_populates="fees", lazy="noload")
 
 
 class Locality(Base):

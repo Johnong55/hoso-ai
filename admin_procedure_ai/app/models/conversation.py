@@ -58,6 +58,11 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     # DD: token_count — số tokens của content
     token_count: Mapped[int | None] = mapped_column(Integer)
+    # Loại section nếu message này sinh từ click chip (vd "steps", "requirements").
+    # Null cho message thường (user input + assistant intro). Cùng giá trị trên
+    # cả USER msg (label chip user click) lẫn ASSISTANT msg (nội dung section)
+    # để dễ pair lại lúc render.
+    section_type: Mapped[str | None] = mapped_column(String(30), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     session: Mapped["ConversationSession"] = relationship(back_populates="messages", lazy="noload")

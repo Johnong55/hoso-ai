@@ -59,25 +59,100 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
-    # ChromaDB
-    CHROMA_HOST: str = "localhost"
-    CHROMA_PORT: int = 8000
-    CHROMA_COLLECTION_NAME: str = "procedure_chunks"
-    CHROMA_PERSIST_DIR: str = "./chroma_data"
+    # Qdrant
+    QDRANT_COLLECTION_NAME: str = "procedure_chunks"
+    # Cloud mode: set QDRANT_URL + QDRANT_API_KEY, leave QDRANT_PERSIST_DIR empty
+    QDRANT_URL: str = ""
+    QDRANT_API_KEY: str = ""
+    # Local/embedded mode: set QDRANT_PERSIST_DIR to a folder path
+    QDRANT_PERSIST_DIR: str = ""
+    # Self-hosted Docker fallback
+    QDRANT_HOST: str = "localhost"
+    QDRANT_PORT: int = 6333
 
-    # ── LLM (Chat) — OpenRouter ───────────────────────────────────────────────
+    # ── LLM (Chat) ────────────────────────────────────────────────────────────
+    # Provider switch: "openrouter" (Gemini/Qwen qua proxy) hoặc "cloudflare"
+    # (Workers AI, nhanh + free tier thoáng).
+    LLM_PROVIDER: str = "openrouter"
+
+    # OpenRouter (Gemini/Qwen)
     LLM_API_KEY: str = ""
     LLM_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_MODEL: str = "qwen/qwen3-6b:free"              # model sinh câu trả lời
-    LLM_MAX_TOKENS: int = 1500
+
+    # Cloudflare Workers AI (OpenAI-compat). Dùng chung CLOUDFLARE_ACCOUNT_ID +
+    # CLOUDFLARE_API_TOKEN với embedding. Model khuyến nghị:
+    #   - "@cf/meta/llama-3.3-70b-instruct-fp8-fast" — chất lượng tốt, ~2-4s
+    #   - "@cf/meta/llama-3.1-8b-instruct-fast" — rất nhanh ~0.5-1.5s, đôi
+    #     khi miss nuance VN. Đổi qua env nếu cần ưu tiên speed.
+    CLOUDFLARE_LLM_MODEL: str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+
+    # Gemini 2.5 là thinking model → thinking tokens và output dùng CHUNG budget này.
+    # Để đủ chỗ cho cả thinking (~1000-1500) lẫn output dài (vài Bước thực hiện),
+    # đặt 4000 trở lên. Gemini 2.5 Flash hỗ trợ tới 8192. Llama không thinking
+    # → 4000 là dư dả cho output.
+    LLM_MAX_TOKENS: int = 4000
     LLM_TEMPERATURE: float = 0.1
 
-    # ── Embedding — Cohere ────────────────────────────────────────────────────
-    # Lấy API key tại: https://dashboard.cohere.com/api-keys
-    # Models: embed-multilingual-v3.0 (1024 dims) | embed-multilingual-light-v3.0 (384 dims)
-    COHERE_API_KEY: str = ""
-    EMBEDDING_MODEL: str = "embed-multilingual-v3.0"
-    EMBEDDING_DIMENSIONS: int = 1024
+    @property
+    def ACTIVE_LLM_BASE_URL(self) -> str:
+        if self.LLM_PROVIDER.lower() == "cloudflare":
+            return (
+                f"https://api.cloudflare.com/client/v4/accounts/"
+                f"{self.CLOUDFLARE_ACCOUNT_ID}/ai/v1"
+            )
+        return self.LLM_BASE_URL
+
+    @property
+    def ACTIVE_LLM_API_KEY(self) -> str:
+        if self.LLM_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_API_TOKEN
+        return self.LLM_API_KEY
+
+    @property
+    def ACTIVE_LLM_MODEL(self) -> str:
+        if self.LLM_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_LLM_MODEL
+        return self.LLM_MODEL
+
+    # ── Embedding (provider switch) ───────────────────────────────────────────
+    # "gemini"     → Google gemini-embedding-001 (3072d), chất lượng tốt nhưng
+    #                free tier giới hạn chặt (100/phút, 1000/ngày).
+    # "cloudflare" → Cloudflare Workers AI @cf/baai/bge-m3 (1024d), đa ngôn ngữ,
+    #                free tier thoáng (~10k Neurons/ngày), ít bị 429.
+    # ⚠ Đổi provider → BẮT BUỘC reset Qdrant collection (dimensions khác nhau).
+    EMBEDDING_PROVIDER: str = "gemini"
+
+    # -- Gemini --
+    # Lấy API key tại: https://aistudio.google.com/app/apikey
+    GEMINI_API_KEY: str = ""
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    GEMINI_EMBEDDING_DIMENSIONS: int = 3072
+    # Throttle chủ động (chỉ áp dụng cho Gemini free tier ~100 req/phút).
+    # 0.7s ≈ 85 req/phút. Đặt 0 để tắt (khi đã lên Tier 1 / dùng Cloudflare).
+    EMBEDDING_MIN_INTERVAL_SEC: float = 0.7
+    # Số lần retry khi gặp 429 (tôn trọng retryDelay từ API).
+    EMBEDDING_MAX_RETRIES: int = 6
+
+    # -- Cloudflare Workers AI --
+    # Account ID + API token tại: https://dash.cloudflare.com → AI → Workers AI
+    CLOUDFLARE_ACCOUNT_ID: str = ""
+    CLOUDFLARE_API_TOKEN: str = ""
+    CLOUDFLARE_EMBEDDING_MODEL: str = "@cf/baai/bge-m3"
+    CLOUDFLARE_EMBEDDING_DIMENSIONS: int = 1024
+
+    # -- Active model/dims (resolve theo provider) --
+    @property
+    def EMBEDDING_MODEL(self) -> str:
+        if self.EMBEDDING_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_EMBEDDING_MODEL
+        return self.GEMINI_EMBEDDING_MODEL
+
+    @property
+    def EMBEDDING_DIMENSIONS(self) -> int:
+        if self.EMBEDDING_PROVIDER.lower() == "cloudflare":
+            return self.CLOUDFLARE_EMBEDDING_DIMENSIONS
+        return self.GEMINI_EMBEDDING_DIMENSIONS
 
     # --- Backward compat aliases ---
     @property
@@ -120,6 +195,8 @@ class Settings(BaseSettings):
     CRAWLER_TIMEOUT: int = 30
     CRAWL_SCHEDULE_HOUR: int = 2
     CRAWL_SCHEDULE_MINUTE: int = 0
+    # Concurrency cho crawler JSON API DVCQG
+    DVCQG_CRAWL_CONCURRENCY: int = 5
 
 
 @lru_cache
