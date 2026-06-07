@@ -43,9 +43,31 @@ async def request_section(
     User click 1 chip → backend format section đó cho thủ tục đã xác định.
     Result append vào session hiện tại như 1 assistant message mới (nếu user
     đã đăng nhập + có session_id). Guest dùng session local trên FE.
+
+    Phase 9: check Redis cache trước → instant nếu pre-cache đã xong từ task
+    background fired sau /chat/ask. Miss → fall back live LLM.
     """
     service = ChatService(db)
     return await service.request_section(payload, current_user)
+
+
+@router.get("/section/status")
+async def section_cache_status(
+    session_id: str,
+    procedure_code: str,
+    sections: str,
+    _: User | None = Depends(get_current_user_optional),
+):
+    """
+    Phase 9: check sections nào đã có cache. FE poll mỗi 1-2s sau /chat/ask
+    để show icon "ready" trên chip → user biết click sẽ instant.
+
+    `sections`: comma-separated list, vd "steps,requirements,fees,agency,forms".
+    """
+    from app.services.chat.section_cache import get_status
+    section_list = [s.strip() for s in sections.split(",") if s.strip()]
+    cache_map = await get_status(session_id, procedure_code, section_list)
+    return {"procedure_code": procedure_code, "ready": cache_map}
 
 
 @router.post("/sessions", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)

@@ -509,3 +509,132 @@ async def _retry_failed_async() -> dict:
 
     logger.info(f"Task | retry_failed | retried={retried}")
     return {"retried": retried}
+
+
+# ── Phase 9: pre-cache sections cho instant chip click ─────────────────────────
+
+@celery_app.task(
+    name="app.worker.tasks.prefetch_sections",
+    bind=True,
+    max_retries=1,
+    default_retry_delay=10,
+)
+def prefetch_sections(
+    self,
+    session_id: str,
+    procedure_code: str,
+    section_types: list[str],
+    user_context: str | None = None,
+) -> dict:
+    """
+    Sau khi /chat/ask trả procedure_focus, enqueue task này để pre-generate
+    nội dung TẤT CẢ section trong background. Lưu vào Redis 30 phút.
+
+    Khi user click chip, /chat/section đọc Redis trước → instant. Nếu miss
+    (race condition khi click sớm) → fall back live LLM.
+
+    session_id giúp filter case_group theo user_context riêng của session.
+    """
+    return _run_async(_prefetch_async(session_id, procedure_code, section_types, user_context))
+
+
+async def _prefetch_async(
+    session_id: str,
+    procedure_code: str,
+    section_types: list[str],
+    user_context: str | None,
+) -> dict:
+    import asyncio
+    import time
+    from sqlalchemy import select
+
+    from app.db.base import AsyncSessionLocal
+    from app.models.procedure import Procedure
+    from app.services.chat.section_cache import set_section
+    from app.services.chat.chat_service import ChatService
+    from app.rag.generation.generator import Generator
+
+    start = time.monotonic()
+    async with AsyncSessionLocal() as db:
+        proc = (await db.execute(
+            select(Procedure).where(Procedure.code == procedure_code)
+        )).scalar_one_or_none()
+        if not proc:
+            logger.warning(f"Prefetch | procedure not found | code={procedure_code}")
+            return {"status": "not_found"}
+
+        svc = ChatService(db)
+        generator = Generator()
+
+        # Build raw data + gen LLM cho từng section, song song
+        async def _one(section_type: str) -> tuple[str, bool]:
+            try:
+                raw_data = await svc._build_section_raw_data(
+                    section_type, proc, procedure_code
+                )
+                if not raw_data:
+                    return section_type, False
+                # forms data: chỉ section "forms" có
+                forms_data: list[dict] = []
+                if section_type == "forms":
+                    from app.models.procedure import ProcedureRequirement
+                    rows = (await db.execute(
+                        select(
+                            ProcedureRequirement.name,
+                            ProcedureRequirement.form_name,
+                            ProcedureRequirement.form_url,
+                        ).where(
+                            ProcedureRequirement.procedure_id == proc.id,
+                            ProcedureRequirement.form_url.is_not(None),
+                        )
+                    )).all()
+                    seen_urls: set[str] = set()
+                    for name, fname, url in rows:
+                        if not url or url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                        forms_data.append({
+                            "name": name,
+                            "form_name": fname,
+                            "url": url,
+                            "procedure_code": proc.code,
+                            "procedure_name": proc.name,
+                        })
+
+                # Gọi LLM (sync trong async wrapper) — generate_section là sync
+                gen = generator.generate_section(
+                    section_type=section_type,
+                    procedure_name=proc.name,
+                    procedure_code=proc.code,
+                    raw_data=raw_data,
+                    user_context=user_context,
+                )
+                await set_section(
+                    session_id=session_id,
+                    procedure_code=procedure_code,
+                    section_type=section_type,
+                    content=gen.answer,
+                    forms=forms_data,
+                )
+                return section_type, True
+            except Exception as e:
+                logger.warning(
+                    f"Prefetch | section {section_type} failed | {e}"
+                )
+                return section_type, False
+
+        results = await asyncio.gather(*[_one(s) for s in section_types])
+
+    elapsed = time.monotonic() - start
+    ok_count = sum(1 for _, ok in results if ok)
+    logger.info(
+        f"Prefetch | code={procedure_code} | session={session_id[:8]}... "
+        f"| sections={len(section_types)} ok={ok_count} | {elapsed:.1f}s"
+    )
+    return {
+        "status": "done",
+        "procedure_code": procedure_code,
+        "sections_total": len(section_types),
+        "sections_ok": ok_count,
+        "elapsed_seconds": round(elapsed, 1),
+    }

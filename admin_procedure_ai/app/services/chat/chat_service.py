@@ -371,6 +371,9 @@ class ChatService:
             sources = self._build_sources(result.chunks)
             forms = await self._build_forms(result.chunks, answer_text=result.answer)
             focus = await self._build_procedure_focus(result.chunks, result.answer)
+            # Phase 9: pre-cache sections cho instant chip click.
+            # Guest dùng cache_id ngẫu nhiên (không có session_id).
+            cache_session_id = self._enqueue_prefetch(focus, payload.question, guest_id=True)
             logger.info(
                 f"Chat | ask | GUEST (no persist) | history={len(history)} "
                 f"| fallback={result.is_fallback} | latency={result.latency_ms}ms "
@@ -378,7 +381,7 @@ class ChatService:
             )
             return AskResponse(
                 answer=result.answer,
-                session_id="",     # FE guest không dùng (đã có session local)
+                session_id=cache_session_id or "",   # FE dùng cache_id cho /chat/section
                 message_id="",
                 sources=sources,
                 forms=forms,
@@ -445,6 +448,8 @@ class ChatService:
         sources = self._build_sources(result.chunks)
         forms = await self._build_forms(result.chunks, answer_text=result.answer)
         focus = await self._build_procedure_focus(result.chunks, result.answer)
+        # Phase 9: enqueue background pre-cache cho instant chip click.
+        self._enqueue_prefetch(focus, payload.question, session_id=session.id)
         logger.info(
             f"Chat | ask | session_id={session.id} | user_id={user.id} "
             f"| fallback={result.is_fallback} | latency={result.latency_ms}ms "
@@ -690,6 +695,47 @@ class ChatService:
             return None
         return self._DVCQG_SUBMIT_URL.format(fid=proc.formality_id)
 
+    def _enqueue_prefetch(
+        self,
+        focus: ProcedureFocus | None,
+        user_question: str,
+        session_id: str | None = None,
+        guest_id: bool = False,
+    ) -> str | None:
+        """
+        Phase 9: Sau /chat/ask, fire Celery task pre-cache tất cả section
+        của procedure_focus vào Redis. Background, không đợi.
+
+        Returns: cache_session_id dùng cho /chat/section. Với guest, sinh UUID
+        ngẫu nhiên (lưu trong response, FE truyền lại). Với user đã login,
+        dùng session_id thật.
+        """
+        if not focus or not focus.available_chips:
+            return session_id
+        try:
+            from app.worker.tasks import prefetch_sections
+            cache_session_id = session_id
+            if guest_id and not cache_session_id:
+                import uuid
+                cache_session_id = f"guest:{uuid.uuid4().hex[:16]}"
+            # Bỏ "other_procedures" — không cần LLM, FE render từ related list
+            sections = [s for s in focus.available_chips if s != "other_procedures"]
+            if sections:
+                prefetch_sections.delay(
+                    session_id=cache_session_id,
+                    procedure_code=focus.code,
+                    section_types=sections,
+                    user_context=user_question,
+                )
+                logger.info(
+                    f"Chat | enqueue prefetch | code={focus.code} "
+                    f"| sections={sections} | session={cache_session_id[:12] if cache_session_id else None}..."
+                )
+            return cache_session_id
+        except Exception as e:
+            logger.warning(f"Chat | prefetch enqueue failed | {e}")
+            return session_id
+
     async def _build_procedure_focus(
         self,
         chunks: list[RetrievedChunk],
@@ -886,10 +932,11 @@ class ChatService:
         raw_data = await self._build_section_raw_data(
             section_type, proc, payload.procedure_code
         )
+        cache_hit = False
         if existing:
-            # Idempotent path — reuse nội dung cũ, không gọi LLM
+            # Idempotent path — reuse nội dung cũ trong DB, không gọi LLM
             logger.info(
-                f"Chat | section idempotent | code={proc.code} "
+                f"Chat | section idempotent (DB) | code={proc.code} "
                 f"| type={section_type} | reuse msg_id={existing.id}"
             )
             answer = existing.content
@@ -899,36 +946,62 @@ class ChatService:
             answer = f"Thủ tục này chưa có dữ liệu mục '{SECTION_TYPES[section_type]}'."
             section_forms = []
         else:
-            gen = _pipeline._generator.generate_section(
-                section_type=section_type,
-                procedure_name=proc.name,
+            # Phase 9: check Redis cache trước khi gọi LLM live
+            from app.services.chat.section_cache import get_section, set_section
+            cached = await get_section(
+                session_id=session_id,
                 procedure_code=proc.code,
-                raw_data=raw_data,
-                user_context=user_context,
+                section_type=section_type,
             )
-            answer = gen.answer
-            section_forms = []
-            if section_type == "forms":
-                req_rows = (await self._db.execute(
-                    select(
-                        ProcedureRequirement.name,
-                        ProcedureRequirement.form_name,
-                        ProcedureRequirement.form_url,
-                    ).where(
-                        ProcedureRequirement.procedure_id == proc.id,
-                        ProcedureRequirement.form_url.is_not(None),
-                    )
-                )).all()
-                seen_urls: set[str] = set()
-                for name, fname, url in req_rows:
-                    if not url or url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    section_forms.append(FormItem(
-                        name=name, form_name=fname, url=url,
-                        procedure_code=proc.code,
-                        procedure_name=proc.name,
-                    ))
+            if cached:
+                cache_hit = True
+                logger.info(
+                    f"Chat | section CACHE HIT | code={proc.code} "
+                    f"| type={section_type}"
+                )
+                answer = cached.get("content", "")
+                section_forms = [
+                    FormItem(**f) for f in (cached.get("forms") or [])
+                ]
+            else:
+                gen = _pipeline._generator.generate_section(
+                    section_type=section_type,
+                    procedure_name=proc.name,
+                    procedure_code=proc.code,
+                    raw_data=raw_data,
+                    user_context=user_context,
+                )
+                answer = gen.answer
+                section_forms = []
+                if section_type == "forms":
+                    req_rows = (await self._db.execute(
+                        select(
+                            ProcedureRequirement.name,
+                            ProcedureRequirement.form_name,
+                            ProcedureRequirement.form_url,
+                        ).where(
+                            ProcedureRequirement.procedure_id == proc.id,
+                            ProcedureRequirement.form_url.is_not(None),
+                        )
+                    )).all()
+                    seen_urls: set[str] = set()
+                    for name, fname, url in req_rows:
+                        if not url or url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                        section_forms.append(FormItem(
+                            name=name, form_name=fname, url=url,
+                            procedure_code=proc.code,
+                            procedure_name=proc.name,
+                        ))
+                # Lưu cache cho lần sau (TTL 30 phút)
+                await set_section(
+                    session_id=session_id,
+                    procedure_code=proc.code,
+                    section_type=section_type,
+                    content=answer,
+                    forms=[f.model_dump() for f in section_forms],
+                )
 
         # ── 3. Insert ASSISTANT message sau khi đã có answer ─────────────────
         if user is not None and session_id and not existing:
@@ -947,7 +1020,7 @@ class ChatService:
         logger.info(
             f"Chat | section | code={proc.code} | type={section_type} "
             f"| latency={elapsed_ms}ms | forms={len(section_forms)} "
-            f"| reuse={is_reuse}"
+            f"| reuse={is_reuse} | cache_hit={cache_hit}"
         )
         return SectionResponse(
             answer=answer,
