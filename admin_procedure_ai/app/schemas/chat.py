@@ -39,6 +39,9 @@ class FormItem(BaseModel):
     url: str                        # link tải trực tiếp
     procedure_code: str | None = None
     procedure_name: str | None = None
+    # Phase 11 — cho nút "Hướng dẫn điền":
+    requirement_id: str | None = None    # ID ProcedureRequirement → request form-guide
+    parse_status: str | None = None      # 'ok' | 'failed' | 'unsupported' | None
 
 
 # Kiểu section người dùng có thể tra cứu cho 1 thủ tục.
@@ -112,6 +115,30 @@ class SectionResponse(BaseModel):
     section_type: str
     latency_ms: int
     is_reuse: bool = False                # True nếu idempotent — chip đã click trước
+
+
+class FormGuideRequest(BaseModel):
+    """User click nút 'Hướng dẫn điền' trên 1 form card → request LLM
+    sinh hướng dẫn từ form_content_text + form_fields_json đã parse sẵn."""
+    session_id: str | None = None
+    procedure_code: str = Field(..., min_length=1, max_length=20)
+    requirement_id: str = Field(..., min_length=1, max_length=36)
+
+
+class FormGuideResponse(BaseModel):
+    answer: str
+    session_id: str
+    message_id: str
+    user_message_id: str = ""
+    chip_label: str = ""
+    form_name: str | None = None
+    form_url: str | None = None
+    procedure_code: str
+    requirement_id: str
+    section_type: str                       # "form_guide:{req_id_prefix}"
+    parse_status: str | None = None         # 'ok' | 'failed' | 'unsupported' | None
+    latency_ms: int
+    is_reuse: bool = False
 
 
 class SessionResponse(BaseModel):

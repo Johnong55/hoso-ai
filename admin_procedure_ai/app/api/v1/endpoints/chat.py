@@ -8,6 +8,8 @@ from app.schemas.chat import (
     AskRequest,
     AskResponse,
     CreateSessionRequest,
+    FormGuideRequest,
+    FormGuideResponse,
     SectionRequest,
     SectionResponse,
     SessionHistoryResponse,
@@ -49,6 +51,24 @@ async def request_section(
     """
     service = ChatService(db)
     return await service.request_section(payload, current_user)
+
+
+@router.post("/form-guide", response_model=FormGuideResponse)
+async def request_form_guide(
+    payload: FormGuideRequest,
+    current_user: User | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Phase 11: User click nút "📝 Hướng dẫn điền" trên 1 form card → LLM sinh
+    hướng dẫn 2 phần (Tóm tắt + Chi tiết từng mục) từ nội dung file biểu mẫu
+    đã parse sẵn lúc crawl (form_content_text + form_fields_json).
+
+    Idempotent — click cùng form 2 lần trả lại nội dung cũ. Trả message giải
+    thích nếu form chưa parse / parse fail / định dạng không hỗ trợ.
+    """
+    service = ChatService(db)
+    return await service.request_form_guide(payload, current_user)
 
 
 @router.get("/section/status")

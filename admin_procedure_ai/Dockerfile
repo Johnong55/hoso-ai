@@ -8,12 +8,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-# System deps cho aiomysql + httpx + cryptography
+# System deps:
+#   build-essential, libmysqlclient: cho aiomysql/cryptography wheels
+#   curl: healthcheck
+#   libreoffice-core + writer: Phase 11 parse .doc legacy (convert → docx
+#     → python-docx). Bỏ qua = 100% .doc form bị mark unsupported.
+#   fonts-liberation: tránh warning thiếu font khi LibreOffice render.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         default-libmysqlclient-dev \
         pkg-config \
         curl \
+        libreoffice-core \
+        libreoffice-writer \
+        fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

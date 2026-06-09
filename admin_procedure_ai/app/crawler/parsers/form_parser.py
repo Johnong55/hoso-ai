@@ -21,6 +21,57 @@ from loguru import logger
 BASE_URL = "https://dichvucong.gov.vn"
 
 
+# Tokens tiếng Việt phổ biến — biểu mẫu hành chính nào cũng có vài từ trong đây.
+# Dùng để detect decode .doc OLE thành công vs rác (CJK / control chars trộn space).
+_COMMON_VN_TOKENS = {
+    # Pronoun / preposition / conjunction
+    "của", "và", "trong", "với", "đến", "có", "không", "để", "tại",
+    "này", "cho", "là", "được", "theo", "trên", "khi", "nếu", "hoặc",
+    # Time / date
+    "ngày", "tháng", "năm", "giờ",
+    # Person / contact
+    "tên", "địa", "chỉ", "người", "ông", "bà", "anh", "chị",
+    # Administrative
+    "thông", "tin", "thủ", "tục", "hồ", "sơ", "đăng", "ký", "giấy",
+    "phép", "chứng", "minh", "nhận", "yêu", "cầu", "điều", "khoản",
+    "việt", "nam", "công", "dân", "quận", "huyện", "phường", "xã",
+    "tỉnh", "thành", "phố", "số", "nhà", "đường", "cộng", "hòa",
+    # Form-specific
+    "khai", "đơn", "mẫu", "biểu", "ban", "hành",
+}
+
+
+def _looks_like_vn_text(text: str, min_word_hits: int = 3) -> bool:
+    """
+    Heuristic: text decoded có phải tiếng Việt chuẩn (đầy đủ dấu) không?
+
+    Check 2 điều kiện:
+      1. Có ít nhất `min_word_hits` từ tiếng Việt phổ biến (token-level).
+      2. Có ít nhất 5 ký tự dấu thanh VN trong vùng Latin Extended Additional
+         (0x1E00-0x1EFF) — đảm bảo encoding đúng, không bị mất dấu (vd convert
+         .doc legacy qua LibreOffice trên Windows mất dấu → "CỘNG" → "C?NG").
+
+    Nếu encode đúng nhưng mất dấu (vd text ascii thuần kiểu "Cong hoa xa hoi")
+    → cũng reject vì LLM không dùng được cho hướng dẫn điền form VN.
+    """
+    import re
+
+    if not text or len(text) < 50:
+        return False
+    # ĐK 1: từ VN phổ biến
+    tokens = re.findall(r"[A-Za-zÀ-ỹ]+", text.lower())
+    if len(tokens) < 5:
+        return False
+    hits = sum(1 for t in tokens if t in _COMMON_VN_TOKENS)
+    if hits < min_word_hits:
+        return False
+    # ĐK 2: dấu thanh VN (sample đầu 3000 char đủ)
+    diacritic_count = sum(
+        1 for ch in text[:3000] if 0x1E00 <= ord(ch) <= 0x1EFF
+    )
+    return diacritic_count >= 5
+
+
 class FormField:
     """Một trường trong biểu mẫu."""
     def __init__(self, label: str, hint: str = "", required: bool = True):
@@ -39,17 +90,56 @@ class FormParser:
 
     async def parse_form(self, form_url: str, form_name: str = "") -> dict[str, Any] | None:
         """
-        Download và parse biểu mẫu.
-        Trả về dict: { form_name, form_url, fields: [...], raw_text: str }
+        Download (GET) và parse biểu mẫu — convenience wrapper.
+
+        Lưu ý: DVCQG đòi POST cho /preview-attachment nên đường GET sẽ trả
+        "Request Rejected". Crawler thật dùng `download_attachment()` + truyền
+        bytes vào `parse_bytes()` trực tiếp; `parse_form()` chỉ tiện cho test
+        host khác hoặc URL legacy.
         """
         try:
             content, filename, content_type = await self._download(form_url)
             if not content:
                 return None
+            result = self.parse_bytes(
+                content=content,
+                form_name=form_name,
+                filename_hint=filename,
+                content_type=content_type,
+                source_url=form_url,
+            )
+            if result is None:
+                return None
+            result["form_url"] = form_url
+            return result
+        except Exception as e:
+            logger.error(f"FormParser | failed | url={form_url} | error={e}")
+            return None
 
-            # Dùng form_name làm fallback vì URL thường là download_file.jsp?ma=xxx
-            ext = self._detect_extension(filename or form_name, content_type, form_url)
-            logger.info(f"FormParser | parsing | name={form_name} | ext={ext} | size={len(content)}B")
+    def parse_bytes(
+        self,
+        content: bytes,
+        form_name: str = "",
+        filename_hint: str = "",
+        content_type: str = "",
+        source_url: str = "",
+    ) -> dict[str, Any] | None:
+        """
+        Parse bytes đã download sẵn → fields + raw_text.
+
+        Caller (vd crawler) tự handle HTTP — DVCQG cần POST `/preview-attachment`
+        chứ không GET được. Trả về None nếu không extract được gì có nghĩa.
+
+        Status để caller persist:
+          - 'ok'          → có raw_text hoặc fields
+          - 'unsupported' → ext không nhận diện được, decode fail
+          - 'failed'      → exception khi parse
+        """
+        try:
+            ext = self._detect_extension(filename_hint or form_name, content_type, source_url)
+            logger.info(
+                f"FormParser | parsing | name={form_name} | ext={ext} | size={len(content)}B"
+            )
 
             if ext == "docx":
                 fields, raw_text = self._parse_docx(content)
@@ -63,21 +153,44 @@ class FormParser:
                 # Fallback: parse như plain text
                 raw_text = content.decode("utf-8", errors="ignore")
                 fields = self._extract_fields_from_text(raw_text)
+                if not raw_text.strip():
+                    return {
+                        "form_name": form_name,
+                        "fields": [],
+                        "raw_text": "",
+                        "ext": ext,
+                        "status": "unsupported",
+                    }
 
             if not fields and not raw_text:
-                logger.warning(f"FormParser | no content extracted | url={form_url}")
-                return None
+                logger.warning(f"FormParser | no content extracted | name={form_name}")
+                return {
+                    "form_name": form_name,
+                    "fields": [],
+                    "raw_text": "",
+                    "ext": ext,
+                    "status": "unsupported",
+                }
 
             return {
                 "form_name": form_name,
-                "form_url": form_url,
-                "fields": [{"label": f.label, "hint": f.hint, "required": f.required} for f in fields],
-                "raw_text": raw_text[:5000],  # giới hạn để tránh quá dài
+                "fields": [
+                    {"label": f.label, "hint": f.hint, "required": f.required}
+                    for f in fields
+                ],
+                "raw_text": raw_text[:5000],
+                "ext": ext,
+                "status": "ok",
             }
-
         except Exception as e:
-            logger.error(f"FormParser | failed | url={form_url} | error={e}")
-            return None
+            logger.error(f"FormParser | parse_bytes failed | name={form_name} | {e}")
+            return {
+                "form_name": form_name,
+                "fields": [],
+                "raw_text": "",
+                "ext": "unknown",
+                "status": "failed",
+            }
 
     # ── Download ──────────────────────────────────────────────────────────────
 
@@ -185,50 +298,120 @@ class FormParser:
 
     def _parse_doc_binary(self, content: bytes) -> tuple[list[FormField], str]:
         """
-        Extract text từ file .doc (OLE Word binary).
-        Word lưu text dưới dạng UTF-16 LE trong binary — decode trực tiếp.
-        Không cần thư viện ngoài.
+        Parse .doc OLE Compound Binary File (Word 97-2003).
+
+        Strategy:
+          1. Thử python-docx trước (một số .doc thực ra là .docx rename).
+          2. Thử LibreOffice/antiword qua subprocess nếu binary có trên PATH —
+             đây là cách RELIABLE duy nhất parse .doc.
+          3. Bỏ. Return empty → caller set status='unsupported'.
+
+        Tại sao KHÔNG decode UTF-16 LE thẳng: .doc OLE Compound File lưu text
+        rải rác qua nhiều stream (WordDocument, 1Table, Pieces), encode phụ
+        thuộc FIB header. Decode raw UTF-16 LE chỉ tóm được 1 phần, output
+        trộn lẫn text VN + rác (CJK/control) — không dùng được cho LLM.
+
+        Để support .doc đầy đủ trên prod:
+          - Debian/Ubuntu: apt-get install libreoffice-core libreoffice-writer
+            (hoặc nhẹ hơn: apt-get install antiword)
+          - Windows dev: cài LibreOffice + thêm vào PATH
         """
+        # 1. Thử docx (file rename .doc nhưng thực là .docx)
         try:
-            # Thử python-docx trước (một số .doc thực ra là .docx đổi tên)
+            from docx import Document
+            doc = Document(io.BytesIO(content))
+            raw_lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        raw_lines.append(" | ".join(cells))
+            if raw_lines:
+                text = "\n".join(raw_lines)
+                fields = self._extract_fields_from_text(text)
+                return fields, text
+        except Exception:
+            pass
+
+        # 2. LibreOffice headless / antiword
+        text = self._convert_doc_via_external(content)
+        if text and _looks_like_vn_text(text, min_word_hits=3):
+            fields = self._extract_fields_from_text(text)
+            logger.info(
+                f"FormParser | doc via external | text_len={len(text)} "
+                f"| fields={len(fields)}"
+            )
+            return fields, text[:5000]
+
+        logger.warning(
+            "FormParser | .doc parse skipped — install libreoffice-headless "
+            "hoặc antiword để support file Word 97-2003"
+        )
+        return [], ""
+
+    def _convert_doc_via_external(self, content: bytes) -> str:
+        """Convert .doc → text qua LibreOffice hoặc antiword (best-effort)."""
+        import shutil
+        import subprocess
+        import tempfile
+
+        # antiword — nhanh, nhẹ, output text
+        antiword = shutil.which("antiword")
+        if antiword:
             try:
-                from docx import Document
-                doc = Document(io.BytesIO(content))
-                raw_lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-                for table in doc.tables:
-                    for row in table.rows:
-                        cells = [c.text.strip() for c in row.cells if c.text.strip()]
-                        if cells:
-                            raw_lines.append(" | ".join(cells))
-                if raw_lines:
-                    text = "\n".join(raw_lines)
-                    fields = self._extract_fields_from_text(text)
-                    return fields, text
-            except Exception:
-                pass  # không phải docx, tiếp tục với binary decode
+                with tempfile.NamedTemporaryFile(
+                    suffix=".doc", delete=False
+                ) as tf:
+                    tf.write(content)
+                    tf_path = tf.name
+                try:
+                    result = subprocess.run(
+                        [antiword, tf_path],
+                        capture_output=True, timeout=15,
+                    )
+                    if result.returncode == 0:
+                        return result.stdout.decode("utf-8", errors="ignore")
+                finally:
+                    Path(tf_path).unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"FormParser | antiword failed | {e}")
 
-            # Decode UTF-16 LE — Word .doc lưu text theo encoding này
-            text_utf16 = content.decode("utf-16-le", errors="ignore")
+        # LibreOffice headless — convert .doc → .docx → đọc bằng python-docx
+        # (chính xác hơn convert-to-txt vì txt filter bỏ table/encoding tệ).
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if soffice:
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    in_path = Path(td) / "in.doc"
+                    in_path.write_bytes(content)
+                    subprocess.run(
+                        [
+                            soffice, "--headless",
+                            "--convert-to", "docx",
+                            "--outdir", td, str(in_path),
+                        ],
+                        capture_output=True, timeout=45,
+                    )
+                    out_path = Path(td) / "in.docx"
+                    if out_path.exists():
+                        docx_bytes = out_path.read_bytes()
+                        from docx import Document
+                        doc = Document(io.BytesIO(docx_bytes))
+                        lines = []
+                        for p in doc.paragraphs:
+                            t = p.text.strip()
+                            if t:
+                                lines.append(t)
+                        for table in doc.tables:
+                            for row in table.rows:
+                                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                                if cells:
+                                    lines.append(" | ".join(cells))
+                        return "\n".join(lines)
+            except Exception as e:
+                logger.warning(f"FormParser | libreoffice doc→docx failed | {e}")
 
-            # Lọc bỏ ký tự control, giữ lại text có nghĩa
-            cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text_utf16)
-            # Nhiều khoảng trắng liên tiếp → xuống dòng
-            cleaned = re.sub(r" {4,}", "\n", cleaned)
-            # Lọc các dòng có ít hơn 2 ký tự
-            lines = [ln.strip() for ln in cleaned.split("\n") if len(ln.strip()) >= 2]
-            raw_text = "\n".join(lines)
-
-            if not raw_text.strip():
-                logger.warning("FormParser | doc binary decode produced empty text")
-                return [], ""
-
-            fields = self._extract_fields_from_text(raw_text)
-            logger.info(f"FormParser | doc binary decoded | lines={len(lines)} | fields={len(fields)}")
-            return fields, raw_text[:3000]
-
-        except Exception as e:
-            logger.warning(f"FormParser | doc binary parse error | {e}")
-            return [], ""
+        return ""
 
     # ── PDF Parser ────────────────────────────────────────────────────────────
 
