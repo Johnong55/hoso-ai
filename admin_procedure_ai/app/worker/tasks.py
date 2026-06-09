@@ -382,6 +382,13 @@ async def _process_parsed_procedure(source_id: str, parsed: dict) -> int:
             await db.commit()
 
             logger.info(f"Task | procedure done | code={code} | chunks={len(embedded)}")
+
+            # Phase 11: parse file biểu mẫu trong background (fail-soft)
+            try:
+                parse_procedure_forms.delay(procedure.id)
+            except Exception as e:
+                logger.warning(f"Task | enqueue parse_forms failed | {e}")
+
             return len(embedded)
 
         except Exception as exc:
@@ -509,6 +516,150 @@ async def _retry_failed_async() -> dict:
 
     logger.info(f"Task | retry_failed | retried={retried}")
     return {"retried": retried}
+
+
+# ── Phase 11: parse file biểu mẫu cho hướng dẫn điền form ─────────────────────
+
+_FORM_ID_PROXY_RE = None
+_FORM_ID_LEGACY_RE = None
+
+
+def _extract_file_id(form_url: str) -> str | None:
+    """
+    Trích `fileId` từ form_url để gọi `download_attachment()`. Hỗ trợ:
+      - Proxy mới: /api/v1/forms/<uuid>?name=...
+      - Legacy DVCQG: ?fileId= / ?file_id= / ?ma= / ?id=
+    Trả None nếu không nhận dạng được — caller set status='unsupported'.
+    """
+    import re
+    from urllib.parse import unquote
+
+    global _FORM_ID_PROXY_RE, _FORM_ID_LEGACY_RE
+    if _FORM_ID_PROXY_RE is None:
+        _FORM_ID_PROXY_RE = re.compile(r"/api/v1/forms/([^/?#]+)")
+        _FORM_ID_LEGACY_RE = re.compile(
+            r"[?&](?:file_?id|ma|id)=([^&]+)", re.IGNORECASE
+        )
+
+    if not form_url:
+        return None
+    m = _FORM_ID_PROXY_RE.search(form_url)
+    if m:
+        return unquote(m.group(1))
+    m = _FORM_ID_LEGACY_RE.search(form_url)
+    if m:
+        return unquote(m.group(1))
+    return None
+
+
+@celery_app.task(
+    name="app.worker.tasks.parse_procedure_forms",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=30,
+)
+def parse_procedure_forms(self, procedure_id: str) -> dict:
+    """
+    Tải + parse tất cả file biểu mẫu của 1 procedure → lưu vào
+    procedure_requirements.form_content_text + form_fields_json.
+
+    Chạy sau khi crawl commit xong (fail-soft, không block crawl chính).
+    Cũng dùng cho backfill data cũ qua script parse_existing_forms.py.
+    """
+    return _run_async(_parse_procedure_forms_async(procedure_id))
+
+
+async def _parse_procedure_forms_async(procedure_id: str) -> dict:
+    import asyncio
+    from datetime import datetime, timezone
+
+    import httpx
+    from sqlalchemy import select
+
+    from app.core.config import settings
+    from app.crawler.parsers.form_parser import FormParser
+    from app.crawler.sources.dvcqg_json import _warmup, download_attachment
+    from app.db.base import AsyncSessionLocal
+    from app.models.procedure import ProcedureRequirement
+
+    async with AsyncSessionLocal() as db:
+        reqs = (await db.execute(
+            select(ProcedureRequirement).where(
+                ProcedureRequirement.procedure_id == procedure_id,
+                ProcedureRequirement.form_url.is_not(None),
+            )
+        )).scalars().all()
+
+        if not reqs:
+            return {"status": "skipped", "reason": "no_forms"}
+
+        # Group theo form_url unique để không tải/parse cùng file nhiều lần
+        by_url: dict[str, list[ProcedureRequirement]] = {}
+        for r in reqs:
+            if r.form_url:
+                by_url.setdefault(r.form_url, []).append(r)
+
+        parser = FormParser()
+        now = datetime.now(timezone.utc)
+        stats = {"ok": 0, "failed": 0, "unsupported": 0}
+
+        async with httpx.AsyncClient(
+            http2=False,
+            follow_redirects=True,
+            timeout=settings.CRAWLER_TIMEOUT * 2,
+        ) as client:
+            await _warmup(client)
+            sem = asyncio.Semaphore(3)
+
+            async def _one(url: str, group: list[ProcedureRequirement]):
+                async with sem:
+                    file_id = _extract_file_id(url)
+                    form_name = next((r.form_name for r in group if r.form_name), "") or ""
+
+                    if not file_id:
+                        for r in group:
+                            r.form_parse_status = "unsupported"
+                            r.form_parsed_at = now
+                        stats["unsupported"] += 1
+                        return
+
+                    content = await download_attachment(client, file_id)
+                    if not content:
+                        for r in group:
+                            r.form_parse_status = "failed"
+                            r.form_parsed_at = now
+                        stats["failed"] += 1
+                        return
+
+                    parsed = parser.parse_bytes(
+                        content=content,
+                        form_name=form_name,
+                        source_url=url,
+                    )
+                    status = (parsed or {}).get("status") or "failed"
+                    text = (parsed or {}).get("raw_text") or None
+                    fields = (parsed or {}).get("fields") or None
+
+                    for r in group:
+                        r.form_content_text = text
+                        r.form_fields_json = fields
+                        r.form_parse_status = status
+                        r.form_parsed_at = now
+
+                    if status not in stats:
+                        stats[status] = 0
+                    stats[status] += 1
+
+            await asyncio.gather(*[
+                _one(url, group) for url, group in by_url.items()
+            ])
+
+        await db.commit()
+
+    logger.info(
+        f"Task | parse_forms | proc={procedure_id} | urls={len(by_url)} | {stats}"
+    )
+    return {"status": "done", "procedure_id": procedure_id, **stats}
 
 
 # ── Phase 9: pre-cache sections cho instant chip click ─────────────────────────

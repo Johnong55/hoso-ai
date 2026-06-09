@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, Date, DateTime, Enum, ForeignKey, Integer,
+    JSON, BigInteger, Boolean, Date, DateTime, Enum, ForeignKey, Integer,
     String, Text, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -141,6 +141,13 @@ class ProcedureRequirement(Base):
     # DD: is_required; code dùng is_mandatory (rõ nghĩa hơn)
     is_mandatory: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Phase 11 — content parse từ file biểu mẫu (DOCX/PDF/XLS), dùng để LLM
+    # sinh hướng dẫn điền form. NULL status = chưa parse → backfill index.
+    form_content_text: Mapped[str | None] = mapped_column(Text)
+    form_fields_json: Mapped[list | None] = mapped_column(JSON)
+    form_parsed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    form_parse_status: Mapped[str | None] = mapped_column(String(20), index=True)
 
     procedure: Mapped["Procedure"] = relationship(back_populates="requirements", lazy="noload")
 

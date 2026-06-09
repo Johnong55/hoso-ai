@@ -103,6 +103,28 @@ SECTION_PROMPTS = {
         "Bạn nhận được [DỮ LIỆU] là danh sách biểu mẫu tải về. Liệt kê từng biểu\n"
         "mẫu kèm tên file. Frontend sẽ tự render nút tải. Không bịa thêm form."
     ),
+    "form_guide": (
+        "Bạn nhận được [DỮ LIỆU] gồm 2 phần:\n"
+        "  - [NỘI DUNG FORM]: text trích từ file biểu mẫu (DOCX/PDF).\n"
+        "  - [TRƯỜNG ĐÃ DETECT]: list tên trường + gợi ý điền (có thể trống nếu\n"
+        "    form không có cấu trúc bảng rõ ràng).\n"
+        "Mục tiêu: hướng dẫn người dân TỰ điền form này đúng cách.\n\n"
+        "OUTPUT BẮT BUỘC 2 PHẦN, đúng thứ tự, dùng markdown header `##`:\n\n"
+        "## Tóm tắt\n"
+        "3-5 câu văn xuôi (KHÔNG bullet): mục đích biểu mẫu, ai phải khai, ai phải\n"
+        "ký xác nhận, lưu ý quan trọng (bản chính/sao, công chứng, đính kèm gì).\n\n"
+        "## Chi tiết từng mục\n"
+        "Liệt kê các mục cần điền theo thứ tự trong form. Mỗi mục:\n"
+        "**<Tên mục>**\n"
+        "- Cách điền: <hướng dẫn ngắn gọn, rõ ràng>\n"
+        "- Ví dụ: <ví dụ cụ thể, sát tình huống user nếu có>\n\n"
+        "QUY TẮC:\n"
+        "- CHỈ dựa vào [DỮ LIỆU], không bịa mục không có trong form.\n"
+        "- Bỏ qua mục không rõ ý nghĩa thay vì đoán.\n"
+        "- Mục lặp lại (vd cùng 1 chữ ký nhiều lần) chỉ liệt kê 1 lần.\n"
+        "- Nếu form quá ngắn / không có mục cụ thể → phần Chi tiết chỉ nêu các\n"
+        "  thông tin chính cần khai báo dựa trên nội dung văn bản."
+    ),
     "other_procedures": (
         "Bạn nhận được [DỮ LIỆU] là vài thủ tục liên quan (score gần với TOP-1).\n"
         "Trình bày dạng list: tên + mã + 1 dòng phân biệt mỗi cái. Mời user hỏi\n"
@@ -232,8 +254,16 @@ class Generator:
         # Khi có user_context, thêm rule filter case_group khớp tình huống.
         # Áp dụng mạnh nhất cho requirements + forms (nhiều case_group). Các
         # section khác (steps/fees/agency) thường ít trường hợp → không cần.
+        # form_guide: tận dụng user_context để chọn ví dụ ở mỗi mục.
         filter_rule = ""
-        if user_context and section_type in ("requirements", "forms"):
+        if user_context and section_type == "form_guide":
+            filter_rule = (
+                "\n\n[TÌNH HUỐNG CỦA USER]\n"
+                f"{user_context}\n\n"
+                "Ưu tiên ví dụ ở mỗi mục KHỚP tình huống user (vd user nói "
+                "'thuê nhà ở HN' → ví dụ địa chỉ ghi địa chỉ HN thuê)."
+            )
+        elif user_context and section_type in ("requirements", "forms"):
             filter_rule = (
                 "\n\n[TÌNH HUỐNG CỦA USER]\n"
                 f"{user_context}\n\n"

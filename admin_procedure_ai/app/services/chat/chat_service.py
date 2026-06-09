@@ -22,6 +22,8 @@ from app.schemas.chat import (
     AskRequest,
     AskResponse,
     CreateSessionRequest,
+    FormGuideRequest,
+    FormGuideResponse,
     FormItem,
     MessageResponse,
     ProcedureFocus,
@@ -182,9 +184,11 @@ class ChatService:
             if all_top_codes:
                 form_rows = (await self._db.execute(
                     select(
+                        ProcedureRequirement.id,
                         ProcedureRequirement.name,
                         ProcedureRequirement.form_name,
                         ProcedureRequirement.form_url,
+                        ProcedureRequirement.form_parse_status,
                         Procedure.code,
                         Procedure.name,
                     )
@@ -197,7 +201,7 @@ class ChatService:
 
                 # Index form theo procedure_code
                 forms_by_code: dict[str, list[FormItem]] = {}
-                for req_name, form_name, form_url, proc_code, proc_name in form_rows:
+                for req_id, req_name, form_name, form_url, parse_status, proc_code, proc_name in form_rows:
                     bucket = forms_by_code.setdefault(proc_code, [])
                     if any(f.url == form_url for f in bucket):
                         continue
@@ -207,6 +211,8 @@ class ChatService:
                         url=form_url,
                         procedure_code=proc_code,
                         procedure_name=proc_name,
+                        requirement_id=req_id,
+                        parse_status=parse_status,
                     ))
 
                 # Assign forms vào từng message theo top codes
@@ -590,6 +596,8 @@ class ChatService:
                 url=req.form_url,
                 procedure_code=proc_code,
                 procedure_name=proc_name,
+                requirement_id=req.id,
+                parse_status=req.form_parse_status,
             ))
         return forms
 
@@ -976,16 +984,18 @@ class ChatService:
                 if section_type == "forms":
                     req_rows = (await self._db.execute(
                         select(
+                            ProcedureRequirement.id,
                             ProcedureRequirement.name,
                             ProcedureRequirement.form_name,
                             ProcedureRequirement.form_url,
+                            ProcedureRequirement.form_parse_status,
                         ).where(
                             ProcedureRequirement.procedure_id == proc.id,
                             ProcedureRequirement.form_url.is_not(None),
                         )
                     )).all()
                     seen_urls: set[str] = set()
-                    for name, fname, url in req_rows:
+                    for req_id, name, fname, url, parse_status in req_rows:
                         if not url or url in seen_urls:
                             continue
                         seen_urls.add(url)
@@ -993,6 +1003,8 @@ class ChatService:
                             name=name, form_name=fname, url=url,
                             procedure_code=proc.code,
                             procedure_name=proc.name,
+                            requirement_id=req_id,
+                            parse_status=parse_status,
                         ))
                 # Lưu cache cho lần sau (TTL 30 phút)
                 await set_section(
@@ -1034,6 +1046,182 @@ class ChatService:
             latency_ms=elapsed_ms,
             is_reuse=is_reuse,
         )
+
+    # ── Form guide: hướng dẫn điền 1 biểu mẫu cụ thể ─────────────────────────
+
+    async def request_form_guide(
+        self,
+        payload: FormGuideRequest,
+        user: User | None,
+    ) -> FormGuideResponse:
+        """
+        User click nút "Hướng dẫn điền" trên 1 form card → LLM sinh hướng dẫn
+        từ form_content_text + form_fields_json (đã parse sẵn lúc crawl).
+
+        Idempotent qua section_type = "form_guide:<req_id_prefix>" — click lại
+        cùng 1 form trả về nội dung đã cache trong DB.
+        """
+        import time
+        from app.models.procedure import Procedure, ProcedureRequirement
+
+        start = time.monotonic()
+
+        # Lookup procedure + requirement
+        proc = (await self._db.execute(
+            select(Procedure).where(Procedure.code == payload.procedure_code.strip())
+        )).scalar_one_or_none()
+        if not proc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Không tìm thấy thủ tục mã {payload.procedure_code}.",
+            )
+
+        req = (await self._db.execute(
+            select(ProcedureRequirement).where(
+                ProcedureRequirement.id == payload.requirement_id.strip(),
+                ProcedureRequirement.procedure_id == proc.id,
+            )
+        )).scalar_one_or_none()
+        if not req:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Không tìm thấy giấy tờ/biểu mẫu này cho thủ tục.",
+            )
+
+        # section_type cần fit VARCHAR(60) → dùng prefix 8 chars của UUID
+        req_prefix = req.id.replace("-", "")[:12]
+        section_type = f"form_guide:{req_prefix}"
+        chip_label = f"📝 Hướng dẫn điền: {req.form_name or req.name}"[:200]
+
+        session_id = payload.session_id or ""
+        message_id = ""
+        user_message_id = ""
+        existing = None
+        form_name_display = req.form_name or req.name
+        form_url = req.form_url
+        parse_status = req.form_parse_status
+
+        # ── 1. Insert USER chip-click message + idempotent check ─────────────
+        if user is not None and session_id:
+            session = await self.get_session(session_id, user)
+            existing = (await self._db.execute(
+                select(Message).where(
+                    Message.session_id == session.id,
+                    Message.section_type == section_type,
+                    Message.role == MessageRole.ASSISTANT,
+                ).order_by(Message.created_at.desc()).limit(1)
+            )).scalar_one_or_none()
+            if not existing:
+                user_chip_msg = Message(
+                    session_id=session.id,
+                    role=MessageRole.USER,
+                    content=chip_label,
+                    section_type=section_type,
+                )
+                self._db.add(user_chip_msg)
+                await self._db.flush()
+                user_message_id = user_chip_msg.id
+
+        # ── 2. Build raw_data + gọi LLM ──────────────────────────────────────
+        if existing:
+            answer = existing.content
+            message_id = existing.id
+            logger.info(
+                f"Chat | form_guide idempotent | code={proc.code} "
+                f"| req={req.id[:8]} | reuse msg_id={existing.id}"
+            )
+        elif parse_status != "ok" or not req.form_content_text:
+            # Form chưa parse hoặc parse fail → trả message giải thích, không gọi LLM
+            if parse_status is None:
+                answer = (
+                    "Biểu mẫu này đang được xử lý. Vui lòng thử lại sau vài "
+                    "phút, hoặc tải file biểu mẫu trực tiếp để xem nội dung."
+                )
+            elif parse_status == "unsupported":
+                answer = (
+                    "Định dạng biểu mẫu này hiện chưa được hỗ trợ đọc tự động "
+                    "(file scan hoặc định dạng đặc biệt). Bạn vui lòng tải file "
+                    "trực tiếp để xem hướng dẫn điền."
+                )
+            else:  # failed
+                answer = (
+                    "Không thể đọc nội dung biểu mẫu để tạo hướng dẫn. "
+                    "Bạn có thể tải file trực tiếp và đối chiếu với phần "
+                    "'Giấy tờ cần chuẩn bị' của thủ tục."
+                )
+        else:
+            user_context = await self._extract_original_user_query(payload.session_id)
+            raw_data = self._build_form_guide_raw_data(req)
+            gen = _pipeline._generator.generate_section(
+                section_type="form_guide",
+                procedure_name=proc.name,
+                procedure_code=proc.code,
+                raw_data=raw_data,
+                user_context=user_context,
+            )
+            answer = gen.answer
+
+        # ── 3. Insert ASSISTANT message ──────────────────────────────────────
+        if user is not None and session_id and not existing:
+            assistant_msg = Message(
+                session_id=session.id,
+                role=MessageRole.ASSISTANT,
+                content=answer,
+                section_type=section_type,
+            )
+            self._db.add(assistant_msg)
+            await self._db.flush()
+            message_id = assistant_msg.id
+
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        is_reuse = bool(message_id and not user_message_id and user is not None)
+        logger.info(
+            f"Chat | form_guide | code={proc.code} | req={req.id[:8]} "
+            f"| latency={elapsed_ms}ms | status={parse_status} | reuse={is_reuse}"
+        )
+        return FormGuideResponse(
+            answer=answer,
+            session_id=session_id,
+            message_id=message_id,
+            user_message_id=user_message_id,
+            chip_label=chip_label,
+            form_name=form_name_display,
+            form_url=form_url,
+            procedure_code=proc.code,
+            requirement_id=req.id,
+            section_type=section_type,
+            parse_status=parse_status,
+            latency_ms=elapsed_ms,
+            is_reuse=is_reuse,
+        )
+
+    def _build_form_guide_raw_data(self, req) -> str:
+        """Format form_content_text + form_fields_json thành text feed LLM."""
+        parts: list[str] = []
+        if req.form_name:
+            parts.append(f"[TÊN FILE] {req.form_name}")
+        if req.name:
+            parts.append(f"[TÊN GIẤY TỜ] {req.name}")
+
+        content = (req.form_content_text or "").strip()
+        if content:
+            parts.append("\n[NỘI DUNG FORM]")
+            parts.append(content)
+
+        fields = req.form_fields_json or []
+        if fields:
+            parts.append("\n[TRƯỜNG ĐÃ DETECT]")
+            for i, f in enumerate(fields, 1):
+                label = (f.get("label") or "").strip() if isinstance(f, dict) else ""
+                hint = (f.get("hint") or "").strip() if isinstance(f, dict) else ""
+                if not label:
+                    continue
+                line = f"{i}. {label}"
+                if hint:
+                    line += f" — gợi ý: {hint}"
+                parts.append(line)
+
+        return "\n".join(parts)
 
     async def _extract_original_user_query(self, session_id: str | None) -> str | None:
         """
