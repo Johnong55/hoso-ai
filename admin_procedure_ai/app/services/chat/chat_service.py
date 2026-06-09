@@ -435,6 +435,11 @@ class ChatService:
                 )
                 if inline:
                     result.answer = inline
+                    # Clear sources rich chunks (Step/Fee/Result/LegalBasis
+                    # cards) — chúng không match section content vừa render
+                    # → tránh FE hiện card lệch nội dung. Reload session từ
+                    # DB cũng không có sources → giữ consistent.
+                    sources = []
             # Phase 9: pre-cache sections cho instant chip click.
             # Guest dùng cache_id ngẫu nhiên (không có session_id).
             cache_session_id = self._enqueue_prefetch(focus, payload.question, guest_id=True)
@@ -529,6 +534,9 @@ class ChatService:
                 result.answer = inline
                 assistant_msg.content = inline
                 assistant_msg.section_type = section_intent
+                # Xóa rich chunks sources — không match section content +
+                # giữ consistent giữa live render và reload từ DB.
+                sources = []
                 await self._db.flush()
 
         # Phase 9: enqueue background pre-cache cho instant chip click.
