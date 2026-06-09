@@ -40,6 +40,53 @@ from app.schemas.common import PaginatedResponse
 _pipeline = RAGPipeline()
 
 
+# Keyword → section type cho auto-route /chat/ask khi user hỏi follow-up
+# specific về 1 mục thay vì click chip dock.
+# Match substring trong câu hỏi đã lowercase. Thứ tự ưu tiên: fees/forms trước
+# requirements vì "biểu mẫu" nằm trong forms còn "giấy tờ" trong requirements.
+_SECTION_INTENT_KEYWORDS: list[tuple[str, list[str]]] = [
+    ("fees", [
+        "lệ phí", "phí", "chi phí", "bao nhiêu tiền", "tiền phí",
+        "thời hạn", "thời gian xử lý", "bao lâu", "mất bao lâu", "trong bao",
+    ]),
+    ("forms", [
+        "biểu mẫu", "mẫu đơn", "tải mẫu", "tải form", "tờ khai mẫu",
+    ]),
+    ("agency", [
+        "cơ quan", "nơi nộp", "nộp ở đâu", "địa chỉ nộp",
+        "ai cấp", "ai thực hiện", "cấp nào",
+    ]),
+    ("steps", [
+        "trình tự", "quy trình", "các bước", "bước thực hiện",
+        "thực hiện như nào", "thực hiện thế nào", "làm sao để",
+        "thủ tục đi qua", "tiến hành thế nào",
+    ]),
+    ("requirements", [
+        "giấy tờ", "hồ sơ", "thành phần hồ sơ", "cần chuẩn bị",
+        "cần những gì", "chuẩn bị gì", "cần gì", "tài liệu cần",
+    ]),
+]
+
+
+def _detect_section_intent(question: str) -> str | None:
+    """
+    Phát hiện câu hỏi có nhắm đến 1 section cụ thể không (giấy tờ / lệ phí /
+    bước thực hiện / cơ quan / biểu mẫu). Return SectionType hoặc None.
+
+    Dùng để auto-route /chat/ask → section logic khi user hỏi natural follow-up
+    thay vì click chip dock. LLM gen section content sẽ filter case_group theo
+    user_context = câu hỏi gốc (vd "trường hợp ủy quyền" → chỉ liệt kê case
+    ủy quyền, bỏ qua case main).
+    """
+    if not question:
+        return None
+    q = question.lower()
+    for section_type, kws in _SECTION_INTENT_KEYWORDS:
+        if any(kw in q for kw in kws):
+            return section_type
+    return None
+
+
 class ChatService:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
@@ -377,13 +424,25 @@ class ChatService:
             sources = self._build_sources(result.chunks)
             forms = await self._build_forms(result.chunks, answer_text=result.answer)
             focus = await self._build_procedure_focus(result.chunks, result.answer)
+            # Phase 11.1: auto-route section intent khi user hỏi natural
+            # follow-up (vd "giấy tờ ủy quyền") thay vì click chip dock.
+            section_intent = _detect_section_intent(payload.question)
+            if focus and section_intent:
+                inline = await self._try_inline_section(
+                    focus_code=focus.code,
+                    section_type=section_intent,
+                    user_context=payload.question,
+                )
+                if inline:
+                    result.answer = inline
             # Phase 9: pre-cache sections cho instant chip click.
             # Guest dùng cache_id ngẫu nhiên (không có session_id).
             cache_session_id = self._enqueue_prefetch(focus, payload.question, guest_id=True)
             logger.info(
                 f"Chat | ask | GUEST (no persist) | history={len(history)} "
                 f"| fallback={result.is_fallback} | latency={result.latency_ms}ms "
-                f"| focus={focus.code if focus else None}"
+                f"| focus={focus.code if focus else None} "
+                f"| section_intent={section_intent}"
             )
             return AskResponse(
                 answer=result.answer,
@@ -454,12 +513,31 @@ class ChatService:
         sources = self._build_sources(result.chunks)
         forms = await self._build_forms(result.chunks, answer_text=result.answer)
         focus = await self._build_procedure_focus(result.chunks, result.answer)
+
+        # Phase 11.1: auto-route section intent. Nếu user hỏi cụ thể về 1
+        # section (giấy tờ / lệ phí / ...) + có procedure_focus → thay
+        # intro answer bằng section content filtered theo user_context.
+        # Mark assistant_msg.section_type để idempotent với chip click sau.
+        section_intent = _detect_section_intent(payload.question)
+        if focus and section_intent:
+            inline = await self._try_inline_section(
+                focus_code=focus.code,
+                section_type=section_intent,
+                user_context=payload.question,
+            )
+            if inline:
+                result.answer = inline
+                assistant_msg.content = inline
+                assistant_msg.section_type = section_intent
+                await self._db.flush()
+
         # Phase 9: enqueue background pre-cache cho instant chip click.
         self._enqueue_prefetch(focus, payload.question, session_id=session.id)
         logger.info(
             f"Chat | ask | session_id={session.id} | user_id={user.id} "
             f"| fallback={result.is_fallback} | latency={result.latency_ms}ms "
-            f"| forms={len(forms)} | focus={focus.code if focus else None}"
+            f"| forms={len(forms)} | focus={focus.code if focus else None} "
+            f"| section_intent={section_intent}"
         )
 
         return AskResponse(
@@ -1222,6 +1300,41 @@ class ChatService:
                 parts.append(line)
 
         return "\n".join(parts)
+
+    async def _try_inline_section(
+        self,
+        focus_code: str,
+        section_type: str,
+        user_context: str,
+    ) -> str | None:
+        """
+        Phase 11.1: build + LLM gen section content để inline vào /chat/ask
+        answer khi user hỏi natural follow-up (auto-route from intro mode).
+
+        Return None nếu DB không có data cho section (caller fallback intro
+        normal). Output có prefix "Thủ tục phù hợp..." để vẫn cite procedure.
+        """
+        from app.models.procedure import Procedure
+
+        proc = (await self._db.execute(
+            select(Procedure).where(Procedure.code == focus_code)
+        )).scalar_one_or_none()
+        if not proc:
+            return None
+        raw_data = await self._build_section_raw_data(section_type, proc, focus_code)
+        if not raw_data:
+            return None
+        gen = _pipeline._generator.generate_section(
+            section_type=section_type,
+            procedure_name=proc.name,
+            procedure_code=proc.code,
+            raw_data=raw_data,
+            user_context=user_context,
+        )
+        if gen.is_fallback or not gen.answer.strip():
+            return None
+        prefix = f"Thủ tục phù hợp: **{proc.name}** (mã: {proc.code}).\n\n"
+        return prefix + gen.answer
 
     async def _extract_original_user_query(self, session_id: str | None) -> str | None:
         """
