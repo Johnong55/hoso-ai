@@ -30,6 +30,9 @@ from app.crawler.parsers.dvcqg_json_parser import parse_formality_json
 
 BASE = "https://dichvucong.gov.vn"
 LIST_URL = f"{BASE}/api/v1/submitting/formality/list-all-formality-by-citizen"
+# Endpoint riêng cho thủ tục cấp tỉnh (Phase 12). Body cần `type: "PROVINCE"`
+# và `departmentCode` chứa mã tỉnh (H49, H50, ...). KHÁC endpoint bộ ngành.
+LIST_PUBLIC_URL = f"{BASE}/api/v1/submitting/formality/list-all-public-formality-by-citizen"
 DETAIL_URL = f"{BASE}/api/v1/configuring/formality/get-formality-by-citizen"
 DEPARTMENTS_URL = f"{BASE}/api/v1/configuring/citizen/department/list-with-location"
 ATTACHMENT_URL = f"{BASE}/api/v1/submitting/preview-attachment"
@@ -208,6 +211,88 @@ async def discover_all_procedures(
     logger.info(
         f"DVCQG | discover | done | items={len(out)} "
         f"(dept_code={department_code!r} q={q!r})"
+    )
+    return out
+
+
+# ── List + paginate (province scope - Phase 12) ───────────────────────────────
+
+async def list_procedures_page_province(
+    client: httpx.AsyncClient,
+    last_id: str = "",
+    *,
+    limit: int = 50,
+    q: str = "",
+    category_id: str = "",
+    province_code: str = "",
+) -> dict[str, Any] | None:
+    """
+    Một page list-all-public với scope PROVINCE. DVCQG dùng cùng field
+    `departmentCode` để chứa mã tỉnh (H49, H50, ...) — naming kỳ nhưng API trả về.
+    """
+    payload = {
+        "limit": limit,
+        "lastId": last_id,
+        "q": q,
+        "categoryId": category_id,
+        "departmentCode": province_code,
+        "type": "PROVINCE",
+    }
+    r = await _post_with_retry(client, LIST_PUBLIC_URL, payload)
+    if r is None:
+        return None
+    try:
+        body = r.json()
+    except Exception as e:
+        logger.warning(f"DVCQG | province list page json decode failed | {e}")
+        return None
+    if body.get("code") != "OK":
+        logger.warning(f"DVCQG | province list page non-OK | code={body.get('code')}")
+        return None
+    return body.get("data") or {}
+
+
+async def discover_procedures_for_province(
+    client: httpx.AsyncClient,
+    *,
+    province_code: str,
+    q: str = "",
+    page_size: int = 50,
+    max_pages: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Paginate list-all-public-formality cho 1 tỉnh. Stop khi `items` rỗng hoặc
+    lastId không tiến. Cùng pattern với discover_all_procedures (cho bộ).
+    """
+    out: list[dict[str, Any]] = []
+    last_id = ""
+    page_num = 0
+    while True:
+        page_num += 1
+        if max_pages is not None and page_num > max_pages:
+            logger.info(f"DVCQG | discover province | hit max_pages={max_pages}, stop")
+            break
+        data = await list_procedures_page_province(
+            client, last_id, limit=page_size, q=q, province_code=province_code,
+        )
+        if data is None:
+            logger.warning(f"DVCQG | discover province | page {page_num} failed, stop")
+            break
+        items = data.get("items") or []
+        if not items:
+            break
+        out.extend(items)
+        new_last = data.get("lastId") or ""
+        if not new_last or new_last == last_id:
+            break
+        last_id = new_last
+        logger.debug(
+            f"DVCQG | discover province | page={page_num} got={len(items)} "
+            f"accum={len(out)} | province_code={province_code}"
+        )
+    logger.info(
+        f"DVCQG | discover province | done | items={len(out)} "
+        f"| province_code={province_code!r}"
     )
     return out
 

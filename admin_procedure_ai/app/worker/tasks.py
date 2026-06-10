@@ -62,6 +62,7 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
     from app.models.document import CrawlStatus, ProcessingStatus, DocumentSource
     from app.crawler.sources.dvcqg_json import (
         discover_all_procedures,
+        discover_procedures_for_province,
         fetch_procedures,
     )
 
@@ -79,9 +80,11 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
         try:
             # source_url:
             #   ""/"all"           → discover toàn bộ
-            #   "<departmentCode>" → 1 bộ/ngành, filter server-side (vd "G19")
+            #   "<departmentCode>" → 1 bộ/ngành (G01, G19, ...), filter server-side
+            #   "<provinceCode>"   → 1 tỉnh (H49, H50, ...) — phân biệt qua source_type
             scope = (source.source_url or "").strip()
             scope_low = scope.lower()
+            scope_type = (source.source_type or "").strip()
 
             import httpx
             from app.crawler.sources.dvcqg_json import _warmup
@@ -94,6 +97,14 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
                 if scope_low in ("", "all"):
                     items = await discover_all_procedures(client)
                     logger.info(f"Task | scope=ALL | items={len(items)}")
+                elif scope_type == "dvcqg_province":
+                    # Phase 12: crawl 1 tỉnh — dùng endpoint list-all-public với type=PROVINCE
+                    items = await discover_procedures_for_province(
+                        client, province_code=scope
+                    )
+                    logger.info(
+                        f"Task | scope=PROVINCE code={scope} | items={len(items)}"
+                    )
                 else:
                     items = await discover_all_procedures(
                         client, department_code=scope

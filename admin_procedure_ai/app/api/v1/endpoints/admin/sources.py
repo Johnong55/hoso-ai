@@ -13,6 +13,7 @@ from app.schemas.admin import (
     CrawlAgencyRequest,
     CrawlByCodeResponse,
     CrawlProcedureRequest,
+    CrawlProvinceRequest,
     CrawlTriggerRequest,
     CrawlTriggerResponse,
     DocumentSourceCreate,
@@ -155,6 +156,55 @@ async def crawl_agency(
         task_id=task.id,
         source_id=source.id,
         message=f"Đã kích hoạt crawl bộ/ngành '{source.title}' (code={code}).",
+    )
+
+
+@router.post("/crawl-province", response_model=CrawlTriggerResponse)
+async def crawl_province(
+    payload: CrawlProvinceRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Phase 12: crawl toàn bộ thủ tục của 1 tỉnh/thành phố.
+
+    `province_code` là mã tỉnh DVCQG (vd "H49" cho Quảng Ninh). BE dùng
+    endpoint list-all-public-formality với type=PROVINCE để filter.
+
+    DocumentSource source_type='dvcqg_province' để task detect đúng nhánh
+    discover_procedures_for_province. Dedupe theo source_url = province_code.
+    """
+    code = payload.province_code.strip()
+    existing = (await db.execute(
+        select(DocumentSource).where(
+            DocumentSource.source_url == code,
+            DocumentSource.source_type == "dvcqg_province",
+        )
+    )).scalar_one_or_none()
+
+    if existing:
+        source = existing
+        if payload.province_name:
+            source.title = payload.province_name[:300]
+        source.is_active = True
+    else:
+        source = DocumentSource(
+            title=(payload.province_name or f"Tỉnh/TP {code}")[:300],
+            source_url=code,
+            source_type="dvcqg_province",
+            is_active=True,
+            crawl_frequency=CrawlFrequency.MANUAL,
+        )
+        db.add(source)
+    await db.flush()
+    await db.refresh(source)
+
+    from app.worker.tasks import crawl_and_embed_procedure
+    task = crawl_and_embed_procedure.delay(source.id)
+    return CrawlTriggerResponse(
+        task_id=task.id,
+        source_id=source.id,
+        message=f"Đã kích hoạt crawl tỉnh/TP '{source.title}' (code={code}).",
     )
 
 
