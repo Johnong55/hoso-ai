@@ -66,6 +66,12 @@ class CrawlProcedureRequest(BaseModel):
     code: str = Field(..., pattern=r"^\d+\.\d{4,}$")
 
 
+class CrawlProvinceRequest(BaseModel):
+    """Phase 12: crawl thủ tục cấp tỉnh. province_code là mã DVCQG (H49, H50, ...)."""
+    province_code: str = Field(..., min_length=1, max_length=20)
+    province_name: str | None = Field(None, max_length=300)
+
+
 class CrawlByCodeResponse(BaseModel):
     task_id: str
     code: str
