@@ -24,6 +24,25 @@ class PipelineResult:
     latency_ms: int
 
 
+def _should_rewrite_query(query: str, history: list[dict] | None) -> bool:
+    """
+    Quyết định có cần gọi rewrite_query LLM không.
+
+    rewrite_query có 2 việc: (1) giải nghĩa follow-up thiếu chủ ngữ (cần
+    history), (2) map câu colloquial → tên thủ tục chuẩn.
+
+    Skip (return False) CHỈ khi: turn đầu (không history) VÀ query đã chứa
+    "thủ tục" → user gọi đích danh, đã là retrieval query tốt, rewrite chỉ
+    tốn thêm ~2-3s mà không cải thiện gì.
+
+    Giữ rewrite cho mọi trường hợp còn lại — conservative để KHÔNG làm giảm
+    retrieval quality (tiếng Việt khó đếm từ chính xác để dùng length rule).
+    """
+    if history:
+        return True  # follow-up → cần giải nghĩa tham chiếu
+    return "thủ tục" not in (query or "").lower()
+
+
 class RAGPipeline:
     """
     Orchestrates: query rewrite → embed → retrieve → generate.
@@ -44,9 +63,14 @@ class RAGPipeline:
     ) -> PipelineResult:
         start = time.monotonic()
 
-        # Step 1: Rewrite query for better retrieval
-        rewritten = self._generator.rewrite_query(query, conversation_history)
-        logger.debug(f"RAG | rewritten_query={rewritten!r}")
+        # Step 1: Rewrite query for better retrieval (skip nếu query đã đủ tốt
+        # — tiết kiệm 1 LLM call ~2-3s cho query formal turn đầu).
+        if _should_rewrite_query(query, conversation_history):
+            rewritten = self._generator.rewrite_query(query, conversation_history)
+            logger.debug(f"RAG | rewritten_query={rewritten!r}")
+        else:
+            rewritten = query
+            logger.debug(f"RAG | skip rewrite (query đã formal) | query={query!r}")
 
         # Step 2: Embed the (rewritten) query
         query_embedding = self._embedder.embed_query(rewritten)
