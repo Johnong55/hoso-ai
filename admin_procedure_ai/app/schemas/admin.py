@@ -94,14 +94,46 @@ class SourceProceduresResponse(BaseModel):
     page_size: int
 
 
+class DailyActivityItem(BaseModel):
+    """Số liệu 1 ngày — cho line chart hoạt động 7 ngày qua."""
+    date: str        # ISO yyyy-mm-dd
+    sessions: int    # số phiên mới
+    queries: int     # số câu hỏi
+
+
+class DomainCountItem(BaseModel):
+    """Phân bố thủ tục theo lĩnh vực — cho bar chart."""
+    domain: str
+    count: int
+
+
+class TopProcedureItem(BaseModel):
+    """Top thủ tục được hỏi nhiều / bị rate thấp."""
+    code: str
+    name: str
+    count: int       # số lần được hỏi
+    avg_rating: float | None = None  # rating trung bình nếu có
+
+
 class RAGStatsResponse(BaseModel):
+    # Tổng quan
     total_procedures: int
     total_chunks: int
     total_sessions: int
     total_queries: int
+    total_users: int = 0
+    total_forms_ok: int = 0      # số form đã parse OK (Phase 11)
+    total_feedback: int = 0      # tổng số đánh giá
+    # Chất lượng
     avg_latency_ms: float
     fallback_rate: float
     avg_score: float
+    avg_rating: float = 0.0      # rating trung bình từ feedback (1-5)
+    # Visualizations
+    daily_activity: list[DailyActivityItem] = []
+    domain_distribution: list[DomainCountItem] = []
+    top_procedures: list[TopProcedureItem] = []      # hỏi nhiều nhất
+    top_low_rated: list[TopProcedureItem] = []       # rating thấp nhất
 
 
 class AISettingsResponse(BaseModel):
