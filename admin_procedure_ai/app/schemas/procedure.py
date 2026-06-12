@@ -9,8 +9,11 @@ from app.models.procedure import AuthorityLevel, ProcedureStatus
 class RequirementSchema(BaseModel):
     id: str
     name: str
-    description: str | None  # DD: mô tả chi tiết (bản gốc/sao, công chứng, số lượng...)
+    description: str | None
+    case_group: str | None = None     # Trường hợp áp dụng (vd "Trường hợp ủy quyền")
     form_name: str | None
+    form_url: str | None = None
+    form_parse_status: str | None = None  # 'ok' | 'failed' | 'unsupported' | None
     quantity: str | None
     document_type: str | None
     note: str | None
@@ -22,11 +25,23 @@ class RequirementSchema(BaseModel):
 
 class StepSchema(BaseModel):
     id: str
-    step_order: int  # DD: step_order (was: order — tránh xung đột SQL keyword)
+    step_order: int
     title: str
     description: str | None
     responsible_party: str | None
     duration: str | None
+
+    model_config = {"from_attributes": True}
+
+
+class FeeSchema(BaseModel):
+    """Phí + thời hạn theo từng phương thức nộp hồ sơ."""
+    id: str
+    submission_method: str   # "Trực tiếp" / "Trực tuyến" / "Bưu chính"
+    processing_time: str | None
+    amount_text: str | None  # "150.000 Đồng" / "Miễn phí"
+    description: str | None
+    order: int
 
     model_config = {"from_attributes": True}
 
@@ -53,8 +68,11 @@ class ProcedureDetail(ProcedureListItem):
     legal_basis: str | None
     result: str | None
     coordinating_agency: str | None
+    authority: str | None = None              # Cơ quan có thẩm quyền (bộ ban hành)
+    formality_id: str | None = None           # UUID DVCQG để build URL nộp online
     requirements: list[RequirementSchema] = []
     steps: list[StepSchema] = []
+    fees: list[FeeSchema] = []
     parent_id: str | None
     replaced_by: str | None
     expired_date: datetime | None
