@@ -10,6 +10,8 @@ stream bytes về cho browser với Content-Type + Content-Disposition đúng.
 """
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from loguru import logger
@@ -82,14 +84,18 @@ async def download_form(
 
     filename = (name or f"bieu-mau-{file_id}").strip() or f"bieu-mau-{file_id}"
     media_type = _detect_media_type(content, filename)
+    # HTTP header phải ASCII. Tên file tiếng Việt (vd "7-Mẫu NA6.doc") cần:
+    #   - filename="..."  → ASCII fallback (latin-1 thay non-ASCII bằng "_")
+    #   - filename*=UTF-8''<percent-encoded>  → bản đầy đủ theo RFC 5987
+    ascii_filename = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    encoded_filename = quote(filename, safe="")
     return Response(
         content=content,
         media_type=media_type,
         headers={
-            # RFC 5987: filename* cho non-ASCII (tên file tiếng Việt)
             "Content-Disposition": (
-                f'attachment; filename="{filename}"; '
-                f"filename*=UTF-8''{filename}"
+                f'attachment; filename="{ascii_filename}"; '
+                f"filename*=UTF-8''{encoded_filename}"
             ),
             "Cache-Control": "public, max-age=3600",
         },
