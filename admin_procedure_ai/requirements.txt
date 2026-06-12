@@ -43,6 +43,7 @@ google-genai==0.8.0
 python-docx==1.1.2       # parse DOCX/DOC
 pdfplumber==0.11.4       # parse PDF (text + tables)
 openpyxl==3.1.5          # parse XLSX
+pypdfium2==4.30.0        # PDF → PNG cho vision OCR (PDF scan)
 
 # Logging
 loguru==0.7.2

@@ -416,7 +416,11 @@ class FormParser:
     # ── PDF Parser ────────────────────────────────────────────────────────────
 
     def _parse_pdf(self, content: bytes) -> tuple[list[FormField], str]:
-        """Extract các trường từ file PDF."""
+        """Extract các trường từ file PDF.
+
+        Nếu PDF không có text layer (scan ảnh) → fallback vision LLM OCR
+        (Phase 11 enhancement). Xem `_ocr_pdf_via_vision`.
+        """
         try:
             import pdfplumber
         except ImportError:
@@ -459,6 +463,22 @@ class FormParser:
         except Exception as e:
             logger.warning(f"FormParser | pdf parse error | {e}")
 
+        # Fallback OCR vision cho PDF scan (không có text layer)
+        joined_text = "\n".join(raw_lines).strip()
+        if len(joined_text) < 50:
+            logger.info(
+                f"FormParser | pdf has no text layer (len={len(joined_text)}), "
+                f"trying vision OCR"
+            )
+            ocr_text = self._ocr_pdf_via_vision(content)
+            if ocr_text and len(ocr_text.strip()) >= 50:
+                raw_lines = ocr_text.split("\n")
+                logger.info(
+                    f"FormParser | vision OCR success | extracted={len(ocr_text)}B"
+                )
+            else:
+                logger.warning("FormParser | vision OCR returned empty/short text")
+
         # Fallback extract từ text nếu ít fields
         if len(fields) < 3:
             text_fields = self._extract_fields_from_text("\n".join(raw_lines))
@@ -468,6 +488,102 @@ class FormParser:
                     fields.append(f)
 
         return fields, "\n".join(raw_lines[:200])  # giới hạn raw text
+
+    def _ocr_pdf_via_vision(self, content: bytes) -> str:
+        """OCR PDF scan qua Cloudflare Llama 3.2 Vision (Phase 11 fallback).
+
+        Convert tối đa N trang đầu sang PNG → gọi vision LLM extract text
+        gốc từ ảnh form. Output là plain text feed vào pipeline
+        `_extract_fields_from_text` như form text bình thường.
+
+        Sync (chạy trong Celery worker). Trả "" khi tắt/thiếu config/lỗi.
+        """
+        from app.core.config import settings
+
+        if not settings.FORM_VISION_OCR_ENABLED:
+            return ""
+        if settings.LLM_PROVIDER.lower() != "cloudflare":
+            logger.warning(
+                "FormParser | vision OCR cần LLM_PROVIDER=cloudflare (hiện tại: "
+                f"{settings.LLM_PROVIDER})"
+            )
+            return ""
+        if not settings.CLOUDFLARE_ACCOUNT_ID or not settings.CLOUDFLARE_API_TOKEN:
+            logger.warning("FormParser | vision OCR thiếu CLOUDFLARE credentials")
+            return ""
+
+        try:
+            import pypdfium2 as pdfium
+        except ImportError:
+            logger.warning("FormParser | pypdfium2 not installed | pip install pypdfium2")
+            return ""
+
+        # PDF → PNG bytes, tối đa N trang đầu
+        page_pngs: list[bytes] = []
+        try:
+            pdf = pdfium.PdfDocument(content)
+            n_pages = min(len(pdf), settings.FORM_VISION_MAX_PAGES)
+            for i in range(n_pages):
+                page = pdf[i]
+                # scale=2 → ~150 DPI, cân bằng giữa OCR accuracy và token cost
+                pil_image = page.render(scale=2).to_pil()
+                buf = io.BytesIO()
+                pil_image.save(buf, format="PNG", optimize=True)
+                page_pngs.append(buf.getvalue())
+                page.close()
+            pdf.close()
+        except Exception as e:
+            logger.warning(f"FormParser | pdf → png failed | {e}")
+            return ""
+
+        if not page_pngs:
+            return ""
+
+        # Llama Vision trên CF dùng native endpoint với image=[int array] —
+        # KHÔNG dùng được OpenAI-compat /v1/chat/completions vì format
+        # messages.content array của OpenAI bị CF reject (code 3030).
+        model = settings.CLOUDFLARE_VISION_MODEL.lstrip("/")  # "@cf/..." giữ nguyên
+        url = (
+            f"https://api.cloudflare.com/client/v4/accounts/"
+            f"{settings.CLOUDFLARE_ACCOUNT_ID}/ai/run/{model}"
+        )
+        headers = {
+            "Authorization": f"Bearer {settings.CLOUDFLARE_API_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        prompt = (
+            "Đây là ảnh chụp một biểu mẫu hành chính của Việt Nam. "
+            "Hãy đọc và viết lại TOÀN BỘ nội dung văn bản trong ảnh, giữ nguyên "
+            "thứ tự và cấu trúc dòng. Bao gồm: tiêu đề, các mục đánh số, "
+            "các trường cần điền (kèm dấu ba chấm/đường gạch chỗ trống), ghi chú. "
+            "Chỉ trả lời nội dung văn bản đã đọc, KHÔNG thêm giải thích."
+        )
+
+        all_text_parts: list[str] = []
+        with httpx.Client(timeout=120.0) as client:
+            for idx, png_bytes in enumerate(page_pngs):
+                payload = {
+                    "image": list(png_bytes),  # CF yêu cầu int array
+                    "prompt": prompt,
+                    "max_tokens": 2000,
+                }
+                try:
+                    r = client.post(url, headers=headers, json=payload)
+                    if r.status_code != 200:
+                        logger.warning(
+                            f"FormParser | vision OCR page {idx+1} | "
+                            f"status={r.status_code} | body={r.text[:300]}"
+                        )
+                        continue
+                    data = r.json()
+                    text = (data.get("result") or {}).get("response", "")
+                    if text:
+                        all_text_parts.append(text.strip())
+                except Exception as e:
+                    logger.warning(f"FormParser | vision OCR page {idx+1} failed | {e}")
+                    continue
+
+        return "\n\n".join(all_text_parts)
 
     # ── Excel Parser ──────────────────────────────────────────────────────────
 

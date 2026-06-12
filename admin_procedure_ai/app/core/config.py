@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     #   - "@cf/meta/llama-3.1-8b-instruct-fast" — rất nhanh ~0.5-1.5s, đôi
     #     khi miss nuance VN. Đổi qua env nếu cần ưu tiên speed.
     CLOUDFLARE_LLM_MODEL: str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    # Vision model dùng cho OCR biểu mẫu scan (Phase 11 fallback). Llama 3.2
+    # 11B Vision — free tier CF, optimized cho visual recognition + captioning.
+    CLOUDFLARE_VISION_MODEL: str = "@cf/meta/llama-3.2-11b-vision-instruct"
+    # Bật/tắt fallback OCR vision khi PDF không có text layer. Set False để
+    # giữ hành vi cũ (mark unsupported).
+    FORM_VISION_OCR_ENABLED: bool = True
+    # Số trang tối đa gửi sang vision model (mỗi trang ≈ 1 request, tốn token).
+    FORM_VISION_MAX_PAGES: int = 3
 
     # Gemini 2.5 là thinking model → thinking tokens và output dùng CHUNG budget này.
     # Để đủ chỗ cho cả thinking (~1000-1500) lẫn output dài (vài Bước thực hiện),
