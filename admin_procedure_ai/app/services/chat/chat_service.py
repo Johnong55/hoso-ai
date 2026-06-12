@@ -226,6 +226,19 @@ class ChatService:
                 ordered = sorted(final, key=lambda c: -next((sc for cc, sc in lst if cc == c), 0))
                 top_codes_by_msg[msg_id] = set(ordered[:2])
 
+            # Section messages (vd "forms", "requirements") KHÔNG có
+            # RAGGenerationLog riêng → top_codes_by_msg không có entry. Chúng
+            # bám theo procedure của intro liền trước trong cùng session.
+            # Propagate để form cards / online URL re-derive sau reload.
+            last_intro_codes: set[str] = set()
+            for m in messages:
+                if m.role != MessageRole.ASSISTANT:
+                    continue
+                if m.id in top_codes_by_msg:
+                    last_intro_codes = top_codes_by_msg[m.id]
+                elif m.section_type and last_intro_codes:
+                    top_codes_by_msg[m.id] = last_intro_codes
+
             # Pha 2: query form rows cho UNION các (msg_id, top_codes)
             all_top_codes = {c for s in top_codes_by_msg.values() for c in s}
             if all_top_codes:
