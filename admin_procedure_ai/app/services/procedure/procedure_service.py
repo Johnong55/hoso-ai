@@ -28,7 +28,14 @@ class ProcedureService:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
 
-    async def search(self, params: ProcedureSearchRequest) -> PaginatedResponse[ProcedureListItem]:
+    async def search(
+        self,
+        params: ProcedureSearchRequest,
+        *,
+        agency_code: str | None = None,
+    ) -> PaginatedResponse[ProcedureListItem]:
+        """Search procedures với filter. `agency_code` (G02, H49, ...) match
+        qua chain Procedure → DocumentChunk → DocumentSource.source_url."""
         query = select(Procedure)
 
         if params.status:
@@ -42,6 +49,20 @@ class ProcedureService:
             query = query.where(
                 or_(Procedure.name.ilike(like), Procedure.code.ilike(like))
             )
+        if agency_code:
+            from app.models.document import DocumentChunk, DocumentSource
+            # Subquery: procedure_ids thuộc 1 source có source_url match.
+            # DISTINCT để tránh duplicate khi 1 procedure có nhiều chunks.
+            proc_ids_subq = (
+                select(DocumentChunk.procedure_id)
+                .join(DocumentSource, DocumentSource.id == DocumentChunk.source_id)
+                .where(
+                    DocumentSource.source_url == agency_code,
+                    DocumentChunk.procedure_id.is_not(None),
+                )
+                .distinct()
+            )
+            query = query.where(Procedure.id.in_(proc_ids_subq))
 
         count_q = select(func.count()).select_from(query.subquery())
         total = (await self._db.execute(count_q)).scalar_one()
