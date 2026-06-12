@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models.procedure import (
     Procedure,
+    ProcedureFee,
     ProcedureRequirement,
     ProcedureStatus,
     ProcedureStep,
@@ -60,13 +61,20 @@ class ProcedureService:
         )
 
     async def get_by_id(self, procedure_id: str) -> ProcedureDetail:
+        """Lookup theo procedure.id (UUID) hoặc procedure.code (vd "1.001612").
+        FE thường dùng code trong URL → smart detect: chứa dấu "." → là code."""
+        is_code = "." in procedure_id
         result = await self._db.execute(
             select(Procedure)
             .options(
                 selectinload(Procedure.requirements),
                 selectinload(Procedure.steps),
+                selectinload(Procedure.fees),
             )
-            .where(Procedure.id == procedure_id)
+            .where(
+                Procedure.code == procedure_id if is_code
+                else Procedure.id == procedure_id
+            )
         )
         procedure = result.scalar_one_or_none()
         if not procedure:
