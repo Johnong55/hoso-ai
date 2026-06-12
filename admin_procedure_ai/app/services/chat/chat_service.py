@@ -862,7 +862,9 @@ class ChatService:
             return None
 
         # Ưu tiên procedure được LLM cite trong answer; nếu không cite → score top
-        cited = self._extract_cited_codes(answer_text, chunks)
+        # Lọc cited chỉ giữ mã có trong retrieval chunks (best_score) để tránh
+        # KeyError khi LLM cite mã ngoài context (hallucinate hoặc trích từ training).
+        cited = [c for c in self._extract_cited_codes(answer_text, chunks) if c in best_score]
         if cited:
             top_code = max(
                 cited,
