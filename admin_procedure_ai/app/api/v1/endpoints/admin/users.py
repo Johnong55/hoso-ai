@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_db, require_admin
+from app.models.conversation import ConversationSession
 from app.models.user import User
 from app.schemas.admin import UserAdminResponse, UserAdminUpdateRequest
 from app.schemas.common import PaginatedResponse
@@ -22,10 +23,25 @@ async def list_users(
 ):
     total = (await db.execute(select(func.count()).select_from(User))).scalar_one()
     offset = (page - 1) * page_size
-    result = await db.execute(select(User).order_by(User.created_at.desc()).offset(offset).limit(page_size))
-    users = result.scalars().all()
+
+    session_count = func.count(ConversationSession.id).label("session_count")
+    stmt = (
+        select(User, session_count)
+        .outerjoin(ConversationSession, ConversationSession.user_id == User.id)
+        .group_by(User.id)
+        .order_by(User.created_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    rows = (await db.execute(stmt)).all()
+
+    items = []
+    for user, count in rows:
+        data = UserAdminResponse.model_validate(user).model_copy(update={"session_count": int(count or 0)})
+        items.append(data)
+
     return PaginatedResponse(
-        items=[UserAdminResponse.model_validate(u) for u in users],
+        items=items,
         total=total,
         page=page,
         page_size=page_size,

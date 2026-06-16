@@ -160,6 +160,7 @@ class UserAdminResponse(BaseModel):
     is_active: bool | None
     email_verified: bool | None
     created_at: datetime | None
+    session_count: int = 0
 
     model_config = {"from_attributes": True}
 
