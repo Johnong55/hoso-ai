@@ -188,6 +188,20 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
+    PASSWORD_RESET_EXPIRE_MINUTES: int = 30
+
+    # SMTP — để gửi email reset password. Nếu rỗng → fallback log token ra
+    # backend log (development mode).
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "noreply@hosoai.local"
+    SMTP_FROM_NAME: str = "HoSoAI"
+    SMTP_USE_TLS: bool = True
+
+    # URL frontend dùng để build link reset (vd "https://procedureai.trijohn124.workers.dev")
+    FRONTEND_BASE_URL: str = "http://localhost:5173"
 
     # RAG
     RAG_TOP_K: int = 5

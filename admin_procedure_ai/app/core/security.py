@@ -52,6 +52,17 @@ def create_refresh_token(user_id: str) -> str:
     )
 
 
+def create_password_reset_token(user_id: str, email: str) -> str:
+    """JWT cho luồng quên mật khẩu — TTL ngắn, có email để bind token với account.
+    Nếu user đổi email sau khi token phát hành, token sẽ tự động vô hiệu hóa.
+    """
+    return _create_token(
+        subject=user_id,
+        expires_delta=timedelta(minutes=settings.PASSWORD_RESET_EXPIRE_MINUTES),
+        extra={"type": "password_reset", "email": email},
+    )
+
+
 def decode_token(token: str) -> dict[str, Any]:
     """
     Decode and validate a JWT. Raises JWTError on invalid/expired tokens.

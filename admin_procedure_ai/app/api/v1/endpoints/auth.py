@@ -6,9 +6,11 @@ from app.core.dependencies import get_current_user, get_db
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
+    ForgotPasswordRequest,
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UpdateProfileRequest,
     UserResponse,
@@ -67,3 +69,32 @@ async def change_password(
     service = AuthService(db)
     await service.change_password(current_user, payload)
     return MessageResponse(message="Đổi mật khẩu thành công.")
+
+
+@router.post("/forgot-password", response_model=MessageResponse)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Yêu cầu gửi email đặt lại mật khẩu.
+
+    Luôn trả về thông báo thành công để tránh lộ thông tin email nào đã đăng ký
+    (phòng chống email enumeration). Email chỉ thực sự được gửi nếu tài khoản
+    tồn tại và đang hoạt động.
+    """
+    service = AuthService(db)
+    await service.request_password_reset(payload)
+    return MessageResponse(
+        message="Nếu email tồn tại trong hệ thống, một liên kết đặt lại mật khẩu đã được gửi đến hộp thư của bạn."
+    )
+
+
+@router.post("/reset-password", response_model=MessageResponse)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Đặt lại mật khẩu bằng token nhận được qua email."""
+    service = AuthService(db)
+    await service.reset_password(payload)
+    return MessageResponse(message="Đặt lại mật khẩu thành công. Bạn có thể đăng nhập ngay.")

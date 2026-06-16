@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.security import (
     create_access_token,
+    create_password_reset_token,
     create_refresh_token,
     decode_token,
     hash_password,
@@ -18,13 +19,16 @@ from app.core.security import (
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
+    ForgotPasswordRequest,
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
+    ResetPasswordRequest,
     TokenResponse,
     UpdateProfileRequest,
     UserResponse,
 )
+from app.services.auth.email_service import send_password_reset_email
 
 
 class AuthService:
@@ -130,3 +134,64 @@ class AuthService:
         await self._db.flush()
         await self._db.refresh(user)
         return UserResponse.model_validate(user)
+
+    async def request_password_reset(self, payload: ForgotPasswordRequest) -> None:
+        """Phát hành token reset password và gửi email.
+
+        ⚠ Anti email-enumeration: KHÔNG báo lỗi nếu email không tồn tại. Luôn
+        trả về thành công, chỉ thực sự gửi email khi tài khoản tồn tại + active.
+        """
+        result = await self._db.execute(select(User).where(User.email == payload.email))
+        user = result.scalar_one_or_none()
+
+        if user is None:
+            logger.info(f"Auth | forgot_password | email không tồn tại: {payload.email}")
+            return  # vẫn trả 200 cho client
+
+        if not user.is_active:
+            logger.info(f"Auth | forgot_password | tài khoản bị khóa: user_id={user.id}")
+            return
+
+        token = create_password_reset_token(user.id, user.email or "")
+        send_password_reset_email(
+            to_email=user.email or "",
+            full_name=user.full_name or "",
+            token=token,
+        )
+        logger.info(f"Auth | forgot_password | reset token issued | user_id={user.id}")
+
+    async def reset_password(self, payload: ResetPasswordRequest) -> None:
+        """Verify token reset + đổi mật khẩu mới."""
+        try:
+            token_data = decode_token(payload.token)
+            if token_data.get("type") != "password_reset":
+                raise ValueError("Not a password_reset token")
+            user_id: str = token_data["sub"]
+            token_email: str = token_data.get("email", "")
+        except (JWTError, KeyError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Liên kết đặt lại mật khẩu không hợp lệ hoặc đã hết hạn.",
+            )
+
+        result = await self._db.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Liên kết đặt lại mật khẩu không hợp lệ.",
+            )
+
+        # Bind token với email — nếu user đổi email sau khi phát hành token,
+        # token cũ sẽ vô hiệu hóa.
+        if token_email and user.email and token_email != user.email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Liên kết đặt lại mật khẩu không hợp lệ.",
+            )
+
+        user.password_hash = hash_password(payload.new_password)
+        # Reset login fail counter để user không bị block ngay sau reset
+        user.login_fail_count = 0
+        user.locked_until = None
+        logger.info(f"Auth | reset_password | user_id={user.id}")
