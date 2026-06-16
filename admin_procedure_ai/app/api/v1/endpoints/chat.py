@@ -1,5 +1,5 @@
 # app/api/v1/endpoints/chat.py
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_current_user, get_current_user_optional, get_db
@@ -17,20 +17,53 @@ from app.schemas.chat import (
 )
 from app.schemas.common import MessageResponse, PaginatedResponse
 from app.services.chat.chat_service import ChatService
+from app.services.chat.guest_rate_limit import (
+    GUEST_DAILY_LIMIT,
+    check_and_increment,
+)
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+def _get_client_ip(request: Request) -> str:
+    """Lấy IP thực của client, ưu tiên X-Forwarded-For (qua Cloudflare Tunnel)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 @router.post("/ask", response_model=AskResponse)
 async def ask(
     payload: AskRequest,
+    request: Request,
     current_user: User | None = Depends(get_current_user_optional),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Ask a natural language question about an administrative procedure.
     Works for both guests (no session saved to DB) and authenticated users.
+
+    Guests bị giới hạn 10 câu/ngày theo IP để tránh lạm dụng tài nguyên LLM.
+    User đăng nhập không bị giới hạn ở tầng này.
     """
+    if current_user is None:
+        ip = _get_client_ip(request)
+        allowed, current, limit = await check_and_increment(ip)
+        if not allowed:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail={
+                    "message": (
+                        f"Bạn đã đạt giới hạn {limit} câu hỏi miễn phí trong ngày. "
+                        f"Vui lòng đăng ký tài khoản để tiếp tục sử dụng không giới hạn."
+                    ),
+                    "current": current,
+                    "limit": limit,
+                    "reason": "guest_daily_limit_exceeded",
+                },
+            )
+
     service = ChatService(db)
     return await service.ask(payload, current_user)
 
