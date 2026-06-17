@@ -2,7 +2,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.endpoints import auth, chat, feedback, forms, news, procedures
-from app.api.v1.endpoints.admin import sources, stats, users
+from app.api.v1.endpoints.admin import procedures as admin_procedures, sources, stats, users
 
 api_router = APIRouter()
 
@@ -18,5 +18,6 @@ admin_router = APIRouter(prefix="/admin")
 admin_router.include_router(sources.router)
 admin_router.include_router(stats.router)
 admin_router.include_router(users.router)
+admin_router.include_router(admin_procedures.router)
 
 api_router.include_router(admin_router)
