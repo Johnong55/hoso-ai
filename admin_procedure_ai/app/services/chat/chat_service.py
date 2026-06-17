@@ -204,17 +204,24 @@ class ChatService:
             )).all()
 
             # Per-message: top procedure(s) — top + những cái sát top (≤ _FORM_TOP_SCORE_GAP)
+            from app.rag.generation.generator import FALLBACK_RESPONSE
+            _FALLBACK_SIG = FALLBACK_RESPONSE[:60].lower()
             top_codes_by_msg: dict[str, set[str]] = {}
             grouped: dict[str, list[tuple[str, float]]] = {}
             for msg_id, code, sc in score_rows:
                 grouped.setdefault(msg_id, []).append((code, float(sc)))
             for msg_id, lst in grouped.items():
+                content = msg_content_by_id.get(msg_id) or ""
+                # Message là fallback response (câu hỏi ngoài phạm vi) → skip
+                # re-derive forms. Audit log vẫn lưu chunks retrieve được nhưng
+                # message thực tế không reference thủ tục nào → forms sẽ misleading.
+                if _FALLBACK_SIG in content.lower():
+                    continue
                 lst.sort(key=lambda x: -x[1])
                 top = lst[0][1]
                 score_picks = {c for c, sc in lst if sc >= top - self._FORM_TOP_SCORE_GAP}
                 # Citation tier — chỉ dùng literal mã thủ tục (không có [Nguồn N]
                 # mapping vì chunk order tại audit recovery không cố định).
-                content = msg_content_by_id.get(msg_id) or ""
                 cited = {m for m in self._PROC_CODE_RE.findall(content)}
                 if cited:
                     final = score_picks & cited
