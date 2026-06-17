@@ -52,10 +52,24 @@ QUY TẮC:
 2. Khi có nhiều thủ tục liên quan, chọn THỦ TỤC KHỚP NHẤT (top score) trả lời.
    Các thủ tục khác đã có chip "Xem thủ tục khác" cho user click — không nhắc
    trong text intro.
-3. CHỈ trả lời "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu.
-   Vui lòng liên hệ cơ quan có thẩm quyền để được hỗ trợ." khi [NGỮ CẢNH] HOÀN
-   TOÀN không có thủ tục nào liên quan.
-4. Trích dẫn cuối câu theo định dạng cố định:
+3. KIỂM TRA PHẠM VI TRƯỚC KHI TRẢ LỜI:
+   - Bạn CHỈ tư vấn về thủ tục hành chính của CÔNG DÂN/TỔ CHỨC Việt Nam thực
+     hiện với CƠ QUAN NHÀ NƯỚC (vd: đăng ký khai sinh, cấp CCCD, tạm trú, đăng
+     ký kinh doanh, cấp hộ chiếu, đất đai, hộ tịch...).
+   - Câu hỏi KHÔNG thuộc phạm vi này bao gồm: thời tiết / lời khuyên cá nhân /
+     giải trí / lập trình / toán học / triết học / thủ tục NƯỚC NGOÀI / bảo hành
+     thương mại / chính hệ thống AI này / các câu hỏi nhảm.
+   - Nếu câu hỏi không thuộc phạm vi, BẮT BUỘC trả lời CHÍNH XÁC chuỗi sau và
+     DỪNG (không thêm gì khác, không trích dẫn nguồn):
+     "Tôi không tìm thấy thông tin về vấn đề này trong cơ sở dữ liệu thủ tục
+     hành chính. Vui lòng liên hệ trực tiếp với cơ quan có thẩm quyền hoặc truy
+     cập cổng Dịch vụ công Quốc gia tại dichvucong.gov.vn để được hỗ trợ."
+   - TUYỆT ĐỐI KHÔNG "kéo dài" ý nghĩa câu hỏi để khớp với [NGỮ CẢNH]. Vd câu
+     "trời nắng có nên ra ngoài không" KHÔNG được mapping sang thủ tục về khí
+     tượng thủy văn, dù có context khí tượng — đó là câu hỏi đời thường, không
+     phải thủ tục hành chính.
+4. Trích dẫn cuối câu theo định dạng cố định (CHỈ áp dụng khi đã xác định được
+   thủ tục đúng phạm vi):
    `Nguồn: Thủ tục <tên đầy đủ> (mã: <X.XXXXXX>)`
    Mã lấy literal từ metadata `[mã: ...]` trong [NGỮ CẢNH]. KHÔNG bịa mã.
 5. Trả lời bằng tiếng Việt, văn phong tự nhiên, không bullet trong intro.
@@ -210,16 +224,22 @@ class Generator:
                 f"| max_tokens={settings.LLM_MAX_TOKENS} → tăng LLM_MAX_TOKENS nếu cần"
             )
 
+        # Detect LLM tự sinh fallback response (câu hỏi ngoài phạm vi) → mark
+        # is_fallback=True để dashboard fallback rate phản ánh đúng. So khớp
+        # 60 ký tự đầu (đủ unique, dung sai khi LLM thêm/bớt chút ít).
+        _fallback_signature = FALLBACK_RESPONSE[:60].lower()
+        is_fallback_answer = _fallback_signature in answer.lower()
+
         logger.info(
             f"Generator | model={used_model} | finish={finish} "
             f"| tokens={usage.total_tokens if usage else 0} "
             f"| completion={usage.completion_tokens if usage else 0} "
-            f"| chunks_used={len(chunks)}"
+            f"| chunks_used={len(chunks)} | fallback={is_fallback_answer}"
         )
 
         return GenerationResult(
             answer=answer,
-            is_fallback=False,
+            is_fallback=is_fallback_answer,
             prompt_tokens=usage.prompt_tokens if usage else 0,
             completion_tokens=usage.completion_tokens if usage else 0,
             total_tokens=usage.total_tokens if usage else 0,
