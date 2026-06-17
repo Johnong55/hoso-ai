@@ -434,9 +434,15 @@ class ChatService:
                 domain=payload.domain,
                 conversation_history=history,
             )
-            sources = self._build_sources(result.chunks)
-            forms = await self._build_forms(result.chunks, answer_text=result.answer)
-            focus = await self._build_procedure_focus(result.chunks, result.answer)
+            # Câu hỏi ngoài phạm vi (LLM trả fallback message) → KHÔNG hiện
+            # forms/sources/focus của chunks lệch ngữ cảnh. Vd "iPhone 17"
+            # retrieve nhầm thủ tục nhượng quyền — phải dọn sạch trước render.
+            if result.is_fallback:
+                sources, forms, focus = [], [], None
+            else:
+                sources = self._build_sources(result.chunks)
+                forms = await self._build_forms(result.chunks, answer_text=result.answer)
+                focus = await self._build_procedure_focus(result.chunks, result.answer)
             # Phase 11.1: auto-route section intent khi user hỏi natural
             # follow-up (vd "giấy tờ ủy quyền") thay vì click chip dock.
             section_intent = _detect_section_intent(payload.question)
@@ -528,9 +534,13 @@ class ChatService:
         if not session.title:
             session.title = payload.question[:100]
 
-        sources = self._build_sources(result.chunks)
-        forms = await self._build_forms(result.chunks, answer_text=result.answer)
-        focus = await self._build_procedure_focus(result.chunks, result.answer)
+        # Câu hỏi ngoài phạm vi → không build chips/forms/focus (như guest path).
+        if result.is_fallback:
+            sources, forms, focus = [], [], None
+        else:
+            sources = self._build_sources(result.chunks)
+            forms = await self._build_forms(result.chunks, answer_text=result.answer)
+            focus = await self._build_procedure_focus(result.chunks, result.answer)
 
         # Phase 11.1: auto-route section intent. Nếu user hỏi cụ thể về 1
         # section (giấy tờ / lệ phí / ...) + có procedure_focus → thay
