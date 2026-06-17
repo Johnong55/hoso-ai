@@ -81,11 +81,12 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "qwen/qwen3-6b:free"              # model sinh câu trả lời
 
     # Cloudflare Workers AI (OpenAI-compat). Dùng chung CLOUDFLARE_ACCOUNT_ID +
-    # CLOUDFLARE_API_TOKEN với embedding. Model khuyến nghị:
-    #   - "@cf/meta/llama-3.3-70b-instruct-fp8-fast" — chất lượng tốt, ~2-4s
-    #   - "@cf/meta/llama-3.1-8b-instruct-fast" — rất nhanh ~0.5-1.5s, đôi
-    #     khi miss nuance VN. Đổi qua env nếu cần ưu tiên speed.
-    CLOUDFLARE_LLM_MODEL: str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    # CLOUDFLARE_API_TOKEN với embedding.
+    # ⚠ Llama 3.x đã bị Cloudflare deprecate 2026-05-30. Khuyến nghị:
+    #   - "@cf/meta/llama-4-scout-17b-16e-instruct" — Llama 4 Scout, chất lượng tốt
+    #   - "@cf/google/gemma-3-12b-it" — Gemma 3, fallback ổn định
+    #   - "@cf/qwen/qwen2.5-coder-32b-instruct" — Qwen 2.5, mạnh về tiếng Việt
+    CLOUDFLARE_LLM_MODEL: str = "@cf/meta/llama-4-scout-17b-16e-instruct"
     # Vision model dùng cho OCR biểu mẫu scan (Phase 11 fallback). Llama 3.2
     # 11B Vision — free tier CF, optimized cho visual recognition + captioning.
     CLOUDFLARE_VISION_MODEL: str = "@cf/meta/llama-3.2-11b-vision-instruct"

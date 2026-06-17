@@ -12,11 +12,14 @@ from app.rag.retrieval.retriever import RetrievedChunk
 def _build_model_fallbacks() -> list[str]:
     provider = settings.LLM_PROVIDER.lower()
     if provider == "cloudflare":
+        # ⚠ Các model Llama 3.x đã bị Cloudflare deprecate ngày 2026-05-30.
+        # Chain hiện tại ưu tiên Llama 4 và Gemma 3 / Qwen 2.5 (còn hoạt động).
         chain = [
-            settings.ACTIVE_LLM_MODEL,                       # default từ env
-            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",      # quality, fast variant
-            "@cf/meta/llama-3.1-8b-instruct-fast",           # tốc độ cao
-            "@cf/meta/llama-3.1-8b-instruct",                # fallback regular
+            settings.ACTIVE_LLM_MODEL,                              # default từ env
+            "@cf/meta/llama-4-scout-17b-16e-instruct",              # Llama 4 Scout — primary
+            "@cf/google/gemma-3-12b-it",                            # Gemma 3 fallback
+            "@cf/qwen/qwen2.5-coder-32b-instruct",                  # Qwen 2.5
+            "@cf/mistralai/mistral-small-3.1-24b-instruct",         # Mistral fallback cuối
         ]
     else:
         # OpenRouter / Gemini default chain
