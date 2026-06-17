@@ -3,7 +3,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -160,3 +160,35 @@ class DocumentChunk(Base):
     source: Mapped["DocumentSource"] = relationship(back_populates="chunks", lazy="noload")
     procedure: Mapped["Procedure"] = relationship(back_populates="chunks", lazy="noload")
     retrievals: Mapped[list["RAGRetrieval"]] = relationship(back_populates="chunk", lazy="noload")
+
+
+class CrawlDiffLog(Base):
+    """Lưu kết quả so sánh sau mỗi lần crawl — bảng cũ vs mới.
+
+    Mỗi lần crawl 1 source xong, snapshot diff được lưu vào đây phục vụ
+    admin theo dõi thay đổi theo thời gian.
+    """
+    __tablename__ = "crawl_diff_logs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    source_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("document_sources.id"), nullable=False, index=True
+    )
+    run_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )
+
+    # Số liệu tổng quan
+    added_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    removed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_after: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Chi tiết mã thủ tục (JSON arrays of strings, cap ~200 mỗi mảng)
+    added_codes: Mapped[list | None] = mapped_column(JSON)
+    updated_codes: Mapped[list | None] = mapped_column(JSON)
+    removed_codes: Mapped[list | None] = mapped_column(JSON)
+
+    notes: Mapped[str | None] = mapped_column(Text)

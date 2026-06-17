@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dependencies import get_db, require_admin
-from app.models.document import CrawlFrequency, DocumentChunk, DocumentSource
+from app.models.document import CrawlDiffLog, CrawlFrequency, DocumentChunk, DocumentSource
 from app.models.procedure import Procedure
 from app.models.user import User
 from app.schemas.admin import (
@@ -288,3 +288,103 @@ async def deactivate_source(
         raise HTTPException(status_code=404, detail="Nguồn dữ liệu không tồn tại.")
     source.is_active = False
     return MessageResponse(message="Đã vô hiệu hóa nguồn dữ liệu.")
+
+
+# ── Schedule + Diff history ─────────────────────────────────────────────────
+
+from pydantic import BaseModel
+from datetime import datetime
+
+
+class UpdateScheduleRequest(BaseModel):
+    crawl_frequency: CrawlFrequency
+
+
+class UpdateScheduleResponse(BaseModel):
+    id: str
+    crawl_frequency: str
+    next_crawl_at: datetime | None
+
+
+@router.patch("/{source_id}/schedule", response_model=UpdateScheduleResponse)
+async def update_schedule(
+    source_id: str,
+    payload: UpdateScheduleRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Đổi tần suất tự động crawl cho 1 source.
+
+    Khi chuyển từ MANUAL → tần suất khác, set next_crawl_at = ngay (để Beat
+    pick lên ở lần check tiếp theo). Khi đổi giữa các tần suất, giữ nguyên
+    next_crawl_at hiện có (Beat sẽ tự cập nhật sau lần crawl tới).
+    """
+    from datetime import timezone
+    from fastapi import HTTPException
+
+    result = await db.execute(select(DocumentSource).where(DocumentSource.id == source_id))
+    source = result.scalar_one_or_none()
+    if not source:
+        raise HTTPException(status_code=404, detail="Nguồn dữ liệu không tồn tại.")
+
+    old_freq = source.crawl_frequency
+    source.crawl_frequency = payload.crawl_frequency
+
+    if payload.crawl_frequency == CrawlFrequency.MANUAL:
+        source.next_crawl_at = None
+    elif old_freq == CrawlFrequency.MANUAL or source.next_crawl_at is None:
+        # Vừa bật scheduling → cho phép Beat trigger ở lần check kế
+        source.next_crawl_at = datetime.now(timezone.utc)
+
+    await db.flush()
+    await db.refresh(source)
+    return UpdateScheduleResponse(
+        id=source.id,
+        crawl_frequency=source.crawl_frequency.value,
+        next_crawl_at=source.next_crawl_at,
+    )
+
+
+class DiffLogItem(BaseModel):
+    id: str
+    run_at: datetime
+    added_count: int
+    updated_count: int
+    removed_count: int
+    total_after: int
+    added_codes: list[str] = []
+    updated_codes: list[str] = []
+    removed_codes: list[str] = []
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/{source_id}/diff-history", response_model=list[DiffLogItem])
+async def get_diff_history(
+    source_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Lịch sử so sánh thay đổi của 1 nguồn qua các lần crawl gần nhất."""
+    result = await db.execute(
+        select(CrawlDiffLog)
+        .where(CrawlDiffLog.source_id == source_id)
+        .order_by(CrawlDiffLog.run_at.desc())
+        .limit(limit)
+    )
+    rows = result.scalars().all()
+    return [
+        DiffLogItem(
+            id=r.id,
+            run_at=r.run_at,
+            added_count=r.added_count,
+            updated_count=r.updated_count,
+            removed_count=r.removed_count,
+            total_after=r.total_after,
+            added_codes=r.added_codes or [],
+            updated_codes=r.updated_codes or [],
+            removed_codes=r.removed_codes or [],
+        )
+        for r in rows
+    ]

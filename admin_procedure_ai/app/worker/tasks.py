@@ -59,7 +59,13 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
     from app.core.config import settings
     from app.db.base import AsyncSessionLocal
-    from app.models.document import CrawlStatus, ProcessingStatus, DocumentSource
+    from app.models.document import (
+        CrawlDiffLog,
+        CrawlStatus,
+        DocumentChunk,
+        DocumentSource,
+        ProcessingStatus,
+    )
     from app.crawler.sources.dvcqg_json import (
         discover_all_procedures,
         discover_procedures_for_province,
@@ -76,6 +82,18 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
 
         source.crawl_status = CrawlStatus.CRAWLING
         await db.commit()
+
+        # Snapshot procedure codes hiện đang gắn với source này — dùng để diff
+        # với danh sách sau khi crawl (added/updated/removed).
+        prev_codes_result = await db.execute(
+            select(DocumentChunk.procedure_code)
+            .where(
+                DocumentChunk.source_id == source_id,
+                DocumentChunk.procedure_code.is_not(None),
+            )
+            .distinct()
+        )
+        prev_codes: set[str] = {r[0] for r in prev_codes_result.all() if r[0]}
 
         try:
             # source_url:
@@ -114,7 +132,31 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
                     )
 
             if not items:
-                raise ValueError(f"Không có thủ tục nào từ scope='{scope or 'all'}'")
+                # Crawl chạy OK nhưng nguồn rỗng (vd UBND tỉnh không có thủ tục
+                # nào còn hiệu lực). Đây KHÔNG phải lỗi → set SKIPPED và return
+                # luôn, tránh kích hoạt retry loop của Celery.
+                source.last_crawled_at = datetime.now(timezone.utc)
+                source.crawl_status = CrawlStatus.SKIPPED
+                source.processing_status = ProcessingStatus.EMBEDDED
+                source.error_message = (
+                    f"Không có thủ tục nào trong nguồn (scope='{scope or 'all'}')."
+                )
+                await db.commit()
+                logger.info(
+                    f"Task | crawl | empty source | source_id={source_id} | scope={scope}"
+                )
+                return {
+                    "status": "empty",
+                    "items": 0,
+                    "ok": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "chunks": 0,
+                }
+
+            # Track codes thấy trong lần crawl này + codes thực sự re-embed
+            seen_codes: set[str] = set()
+            embedded_codes: set[str] = set()
 
             # ── Fetch + parse + save từng procedure ───────────────────────────
             total_chunks = 0
@@ -124,6 +166,8 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
             concurrency = settings.DVCQG_CRAWL_CONCURRENCY
 
             async for code, parsed in fetch_procedures(items, concurrency=concurrency):
+                if code:
+                    seen_codes.add(code)
                 if not parsed:
                     failed += 1
                     continue
@@ -137,9 +181,29 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
                     else:
                         total_chunks += n
                         ok += 1
+                        if code:
+                            embedded_codes.add(code)
                 except Exception as e:
                     logger.warning(f"Task | persist failed | code={code} | {e}")
                     failed += 1
+
+            # ── Diff bảng cũ vs mới ───────────────────────────────────────────
+            added = embedded_codes - prev_codes          # NEW + được embed thành công
+            updated = embedded_codes & prev_codes        # CŨ + được re-embed (content đổi)
+            removed = prev_codes - seen_codes            # CŨ + không còn trong nguồn
+
+            diff_log = CrawlDiffLog(
+                source_id=source_id,
+                added_count=len(added),
+                updated_count=len(updated),
+                removed_count=len(removed),
+                total_after=len(seen_codes),
+                # Cap 200 mỗi list để JSON không phình to
+                added_codes=sorted(added)[:200],
+                updated_codes=sorted(updated)[:200],
+                removed_codes=sorted(removed)[:200],
+            )
+            db.add(diff_log)
 
             # ── Cập nhật trạng thái source ────────────────────────────────────
             source.last_crawled_at = datetime.now(timezone.utc)
@@ -147,6 +211,11 @@ async def _crawl_and_embed_async(task, source_id: str) -> dict:
             source.processing_status = ProcessingStatus.EMBEDDED
             source.error_message = None
             await db.commit()
+
+            logger.info(
+                f"Task | crawl_diff | source_id={source_id} | "
+                f"added={len(added)} | updated={len(updated)} | removed={len(removed)}"
+            )
 
             logger.info(
                 f"Task | crawl | done | source_id={source_id} "
@@ -482,24 +551,55 @@ def scheduled_crawl() -> dict:
 
 
 async def _scheduled_crawl_async() -> dict:
-    from sqlalchemy import select
+    """Trigger crawl các source có next_crawl_at <= now và frequency != manual.
+
+    Sau khi enqueue, tự đẩy next_crawl_at theo crawl_frequency của source
+    (daily: +1 ngày, weekly: +7 ngày, monthly: +30 ngày).
+    """
+    from datetime import timedelta
+    from sqlalchemy import or_, select
 
     from app.db.base import AsyncSessionLocal
-    from app.models.document import DocumentSource
+    from app.models.document import CrawlFrequency, DocumentSource
+
+    now = datetime.now(timezone.utc)
+    triggered = 0
+    skipped_manual = 0
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(DocumentSource).where(DocumentSource.is_active == True)  # noqa: E712
+            select(DocumentSource).where(
+                DocumentSource.is_active == True,  # noqa: E712
+                DocumentSource.crawl_frequency != CrawlFrequency.MANUAL,
+                or_(
+                    DocumentSource.next_crawl_at.is_(None),  # chưa lên lịch lần đầu
+                    DocumentSource.next_crawl_at <= now,
+                ),
+            )
         )
-        sources = result.scalars().all()
+        due_sources = result.scalars().all()
 
-    triggered = 0
-    for source in sources:
-        crawl_and_embed_procedure.delay(source.id)
-        triggered += 1
+        for source in due_sources:
+            freq = source.crawl_frequency
+            if freq == CrawlFrequency.DAILY:
+                source.next_crawl_at = now + timedelta(days=1)
+            elif freq == CrawlFrequency.WEEKLY:
+                source.next_crawl_at = now + timedelta(days=7)
+            elif freq == CrawlFrequency.MONTHLY:
+                source.next_crawl_at = now + timedelta(days=30)
+            else:
+                skipped_manual += 1
+                continue
 
-    logger.info(f"Task | scheduled_crawl | triggered={triggered} sources")
-    return {"triggered": triggered}
+            crawl_and_embed_procedure.delay(source.id)
+            triggered += 1
+
+        await db.commit()
+
+    logger.info(
+        f"Task | scheduled_crawl | triggered={triggered} | skipped_manual={skipped_manual}"
+    )
+    return {"triggered": triggered, "skipped_manual": skipped_manual}
 
 
 @celery_app.task(name="app.worker.tasks.retry_failed_embeddings")

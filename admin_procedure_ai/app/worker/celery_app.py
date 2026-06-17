@@ -22,16 +22,16 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     result_expires=3600,
     beat_schedule={
-        "daily-crawl": {
+        # Check schedule mỗi giờ → trigger crawl sources có next_crawl_at <= now.
+        # Mỗi source có crawl_frequency riêng (weekly/monthly/manual), Beat
+        # KHÔNG crawl tất cả nguồn cùng lúc.
+        "check-due-crawls": {
             "task": "app.worker.tasks.scheduled_crawl",
-            "schedule": crontab(
-                hour=settings.CRAWL_SCHEDULE_HOUR,
-                minute=settings.CRAWL_SCHEDULE_MINUTE,
-            ),
+            "schedule": crontab(minute=0),  # mỗi giờ tại phút 0
         },
         "retry-failed-embeddings": {
             "task": "app.worker.tasks.retry_failed_embeddings",
-            "schedule": crontab(minute=0),  # every hour
+            "schedule": crontab(minute=30),  # mỗi giờ tại phút 30 (tránh trùng)
         },
     },
 )
