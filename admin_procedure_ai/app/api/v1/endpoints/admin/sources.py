@@ -306,6 +306,13 @@ class UpdateScheduleResponse(BaseModel):
     next_crawl_at: datetime | None
 
 
+_FREQ_DAYS = {
+    CrawlFrequency.DAILY: 1,
+    CrawlFrequency.WEEKLY: 7,
+    CrawlFrequency.MONTHLY: 30,
+}
+
+
 @router.patch("/{source_id}/schedule", response_model=UpdateScheduleResponse)
 async def update_schedule(
     source_id: str,
@@ -315,11 +322,12 @@ async def update_schedule(
 ):
     """Đổi tần suất tự động crawl cho 1 source.
 
-    Khi chuyển từ MANUAL → tần suất khác, set next_crawl_at = ngay (để Beat
-    pick lên ở lần check tiếp theo). Khi đổi giữa các tần suất, giữ nguyên
-    next_crawl_at hiện có (Beat sẽ tự cập nhật sau lần crawl tới).
+    next_crawl_at được tính lại theo tần suất mới:
+      - MANUAL          → None (tắt scheduling)
+      - daily/weekly/monthly + đã có last_crawled_at → last + period
+      - daily/weekly/monthly + chưa từng crawl       → now (chạy ngay lần check kế)
     """
-    from datetime import timezone
+    from datetime import timedelta, timezone
     from fastapi import HTTPException
 
     result = await db.execute(select(DocumentSource).where(DocumentSource.id == source_id))
@@ -327,14 +335,17 @@ async def update_schedule(
     if not source:
         raise HTTPException(status_code=404, detail="Nguồn dữ liệu không tồn tại.")
 
-    old_freq = source.crawl_frequency
     source.crawl_frequency = payload.crawl_frequency
 
     if payload.crawl_frequency == CrawlFrequency.MANUAL:
         source.next_crawl_at = None
-    elif old_freq == CrawlFrequency.MANUAL or source.next_crawl_at is None:
-        # Vừa bật scheduling → cho phép Beat trigger ở lần check kế
-        source.next_crawl_at = datetime.now(timezone.utc)
+    else:
+        days = _FREQ_DAYS[payload.crawl_frequency]
+        if source.last_crawled_at:
+            source.next_crawl_at = source.last_crawled_at + timedelta(days=days)
+        else:
+            # Chưa từng crawl → cho Beat chạy lần đầu ngay
+            source.next_crawl_at = datetime.now(timezone.utc)
 
     await db.flush()
     await db.refresh(source)
