@@ -101,6 +101,9 @@ class SectionRequest(BaseModel):
     session_id: str | None = None
     procedure_code: str = Field(..., min_length=1, max_length=20)
     section_type: str = Field(..., min_length=1, max_length=30)
+    # Fix B: trường hợp hồ sơ user đã chọn (click case chip). Chỉ dùng cho
+    # section "requirements" khi thủ tục có nhiều case_group. None = chưa chọn.
+    case_group: str | None = Field(None, max_length=500)
 
 
 class SectionResponse(BaseModel):
@@ -119,6 +122,12 @@ class SectionResponse(BaseModel):
     section_type: str
     latency_ms: int
     is_reuse: bool = False                # True nếu idempotent — chip đã click trước
+    # Fix B: danh sách các trường hợp hồ sơ của thủ tục (chỉ requirements,
+    # >=2 case). FE render thành chips để user chọn. Rỗng khi không cần chọn
+    # (1 case, hoặc đã auto-match / đã chọn case cụ thể).
+    case_groups: list[str] = []
+    # Case đang được hiển thị (đã chọn hoặc auto-match). None = đang ở chooser.
+    selected_case_group: str | None = None
 
 
 class FormGuideRequest(BaseModel):
@@ -174,6 +183,10 @@ class MessageResponse(BaseModel):
     # Persisted từ DB (column messages.section_type). Set khi message sinh
     # từ click chip — dùng để FE verify chip đã click sau reload.
     section_type: str | None = None
+    # Fix B: re-derive khi load history cho assistant message của section
+    # requirements có nhiều case_group → FE render lại case chips sau reload.
+    case_groups: list[str] = []
+    selected_case_group: str | None = None
 
     model_config = {"from_attributes": True}
 

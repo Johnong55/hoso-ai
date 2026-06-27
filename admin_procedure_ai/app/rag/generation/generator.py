@@ -415,6 +415,64 @@ class Generator:
         rewritten = rewritten.strip('"').strip()
         return rewritten or query
 
+    def classify_case_group(
+        self, user_context: str, case_groups: list[str]
+    ) -> int | None:
+        """
+        Fix B: chọn case_group khớp NHẤT với tình huống user.
+
+        Trả về index (0-based) trong `case_groups` nếu xác định rõ ràng → BE
+        render thẳng giấy tờ của case đó (không cần hỏi lại). Trả None nếu
+        tình huống quá chung chung / khớp nhiều case / không đủ thông tin →
+        FE hiện chips cho user tự chọn.
+
+        Classify nhẹ, temperature=0 → ổn định, tránh rationalization như khi
+        gen tự do. Không có user_context hoặc <2 case thì caller không gọi.
+        """
+        if not user_context or len(case_groups) < 2:
+            return None
+
+        options = "\n".join(
+            f"{i + 1}. {cg}" for i, cg in enumerate(case_groups)
+        )
+        prompt = (
+            "Bạn là bộ phân loại trường hợp hồ sơ thủ tục hành chính.\n"
+            f"Tình huống của người dân:\n\"{user_context}\"\n\n"
+            f"Các trường hợp hồ sơ có thể áp dụng:\n{options}\n\n"
+            "Nhiệm vụ: chọn DUY NHẤT 1 trường hợp khớp RÕ RÀNG với tình huống.\n"
+            "QUY TẮC:\n"
+            "- Nếu tình huống nêu rõ và khớp chắc chắn 1 trường hợp → trả về\n"
+            "  SỐ thứ tự của trường hợp đó (1, 2, 3, ...).\n"
+            "- Nếu tình huống chung chung, thiếu thông tin, hoặc khớp nhiều\n"
+            "  trường hợp → trả về 0.\n"
+            "- TUYỆT ĐỐI không suy diễn ép buộc để chọn cho bằng được.\n"
+            "CHỈ trả về 1 con số duy nhất, không giải thích."
+        )
+        response, _ = self._call_with_fallback(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=10,
+            extra_body={
+                "extra_body": {"google": {"thinking_config": {"thinking_budget": 0}}}
+            },
+        )
+        if response is None:
+            return None
+        raw = (response.choices[0].message.content or "").strip()
+        # Lấy số đầu tiên xuất hiện (model có thể trả "Trường hợp 2" hoặc "2.")
+        import re
+        m = re.search(r"\d+", raw)
+        if not m:
+            return None
+        n = int(m.group())
+        if 1 <= n <= len(case_groups):
+            logger.info(
+                f"Generator | classify_case_group | matched #{n} "
+                f"({case_groups[n - 1]!r})"
+            )
+            return n - 1
+        return None
+
     def _call_with_fallback(
         self,
         messages: list[dict],

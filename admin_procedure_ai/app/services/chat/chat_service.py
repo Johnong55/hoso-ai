@@ -320,11 +320,47 @@ class ChatService:
             messages, top_codes_by_msg if assistant_ids else {}
         )
 
+        # Fix B: re-derive case_groups cho chooser message (section_type
+        # "requirements") để FE render lại case chips sau reload. Lấy
+        # procedure_code từ top_codes_by_msg (đã propagate xuống section msg).
+        case_groups_by_msg: dict[str, list[str]] = {}
+        chooser_codes: dict[str, str] = {}
+        for m in messages:
+            if (
+                m.role == MessageRole.ASSISTANT
+                and m.section_type == "requirements"
+            ):
+                codes = top_codes_by_msg.get(m.id) if assistant_ids else None
+                if codes:
+                    chooser_codes[m.id] = next(iter(codes))
+        if chooser_codes:
+            from app.models.procedure import Procedure
+            needed = set(chooser_codes.values())
+            proc_id_by_code = {
+                code: pid for pid, code in (await self._db.execute(
+                    select(Procedure.id, Procedure.code).where(
+                        Procedure.code.in_(needed)
+                    )
+                )).all()
+            }
+            cache: dict[str, list[str]] = {}
+            for msg_id, code in chooser_codes.items():
+                pid = proc_id_by_code.get(code)
+                if not pid:
+                    continue
+                if code not in cache:
+                    cache[code] = await self._get_requirement_case_groups(pid)
+                cases = cache[code]
+                if len(cases) >= 2:
+                    case_groups_by_msg[msg_id] = cases
+
         msg_responses: list[MessageResponse] = []
         for m in messages:
             resp = MessageResponse.model_validate(m)
             resp.forms = forms_by_msg.get(m.id, [])
             resp.procedure_focus = focus_by_msg.get(m.id)
+            if m.id in case_groups_by_msg:
+                resp.case_groups = case_groups_by_msg[m.id]
             msg_responses.append(resp)
 
         return SessionHistoryResponse(
@@ -1085,6 +1121,41 @@ class ChatService:
         chip_label = SECTION_TYPES.get(section_type, section_type)
         existing = None
 
+        # ── Fix B: case-aware requirements ───────────────────────────────────
+        # Thủ tục có >=2 trường hợp hồ sơ (case_group) → KHÔNG dump full mà:
+        #   (a) user đã click 1 case chip (payload.case_group) → render case đó,
+        #   (b) auto-match case từ tình huống user (classify) nếu rõ ràng,
+        #   (c) không xác định được → trả "chooser" + list case cho FE hiện chips.
+        # `db_section_type` = giá trị lưu DB / cache key (vd "requirements#2") để
+        # idempotent + cache tách biệt theo từng case. `section_type` (base) vẫn
+        # dùng cho switch build raw_data + label.
+        req_cases: list[str] = []
+        selected_case: str | None = None
+        case_chooser = False
+        auto_matched = False        # True nếu BE tự đoán case (không phải click)
+        db_section_type = section_type
+        if section_type == "requirements":
+            req_cases = await self._get_requirement_case_groups(proc.id)
+            if len(req_cases) >= 2:
+                sel = (payload.case_group or "").strip()
+                if sel and sel in req_cases:
+                    selected_case = sel
+                elif not sel and user_context:
+                    idx = _pipeline._generator.classify_case_group(
+                        user_context, req_cases
+                    )
+                    if idx is not None:
+                        selected_case = req_cases[idx]
+                        auto_matched = True
+                if selected_case:
+                    db_section_type = f"requirements#{req_cases.index(selected_case)}"
+                    # Explicit click → user bubble = tên case. Auto-match →
+                    # user chỉ bấm "Giấy tờ", giữ label section gốc.
+                    if not auto_matched:
+                        chip_label = selected_case
+                else:
+                    case_chooser = True
+
         # ── 1. Insert USER chip-click message TRƯỚC khi gọi LLM ─────────────
         # Lý do: created_at qua server NOW() có precision giây. Nếu 2 message
         # cùng giây thì ORDER BY created_at trong history loader không stable
@@ -1095,7 +1166,7 @@ class ChatService:
             existing = (await self._db.execute(
                 select(Message).where(
                     Message.session_id == session.id,
-                    Message.section_type == section_type,
+                    Message.section_type == db_section_type,
                     Message.role == MessageRole.ASSISTANT,
                 ).order_by(Message.created_at.desc()).limit(1)
             )).scalar_one_or_none()
@@ -1104,26 +1175,38 @@ class ChatService:
                     session_id=session.id,
                     role=MessageRole.USER,
                     content=chip_label,
-                    section_type=section_type,
+                    section_type=db_section_type,
                 )
                 self._db.add(user_chip_msg)
                 await self._db.flush()
                 user_message_id = user_chip_msg.id
 
         # ── 2. Build raw_data + gọi LLM (~1-2s) — tạo time gap với USER msg ──
-        raw_data = await self._build_section_raw_data(
-            section_type, proc, payload.procedure_code
-        )
+        # Chooser (Fix B) không cần raw_data/LLM — chỉ trả lời mời user chọn case.
+        raw_data = ""
+        if not existing and not case_chooser:
+            raw_data = await self._build_section_raw_data(
+                section_type, proc, payload.procedure_code, case_group=selected_case
+            )
         cache_hit = False
         if existing:
             # Idempotent path — reuse nội dung cũ trong DB, không gọi LLM
             logger.info(
                 f"Chat | section idempotent (DB) | code={proc.code} "
-                f"| type={section_type} | reuse msg_id={existing.id}"
+                f"| type={db_section_type} | reuse msg_id={existing.id}"
             )
             answer = existing.content
             message_id = existing.id
             section_forms: list[FormItem] = []
+        elif case_chooser:
+            # Multi-case + chưa xác định trường hợp → mời user chọn qua chips.
+            answer = (
+                f"Thủ tục **{proc.name}** có {len(req_cases)} trường hợp hồ sơ "
+                f"khác nhau, mỗi trường hợp cần bộ giấy tờ riêng. Bạn hãy chọn "
+                f"trường hợp đúng với tình huống của mình bên dưới để xem chính "
+                f"xác giấy tờ cần chuẩn bị:"
+            )
+            section_forms = []
         elif not raw_data:
             answer = f"Thủ tục này chưa có dữ liệu mục '{SECTION_TYPES[section_type]}'."
             section_forms = []
@@ -1133,27 +1216,36 @@ class ChatService:
             cached = await get_section(
                 session_id=session_id,
                 procedure_code=proc.code,
-                section_type=section_type,
+                section_type=db_section_type,
             )
             if cached:
                 cache_hit = True
                 logger.info(
                     f"Chat | section CACHE HIT | code={proc.code} "
-                    f"| type={section_type}"
+                    f"| type={db_section_type}"
                 )
                 answer = cached.get("content", "")
                 section_forms = [
                     FormItem(**f) for f in (cached.get("forms") or [])
                 ]
             else:
+                # Đã chọn/auto-match 1 case → raw_data đã lọc sẵn → tắt
+                # filter-by-context của LLM (tránh hỏi lại / lọc 2 lần).
                 gen = _pipeline._generator.generate_section(
                     section_type=section_type,
                     procedure_name=proc.name,
                     procedure_code=proc.code,
                     raw_data=raw_data,
-                    user_context=user_context,
+                    user_context=None if selected_case else user_context,
                 )
                 answer = gen.answer
+                # Fix B: nêu rõ giấy tờ thuộc trường hợp nào (đặc biệt khi BE
+                # auto-match) → user xác nhận đúng tình huống của mình.
+                if selected_case:
+                    answer = (
+                        f"Với **trường hợp: {selected_case}**, bạn cần chuẩn bị "
+                        f"các giấy tờ sau:\n\n{answer}"
+                    )
                 section_forms = []
                 if section_type == "forms":
                     req_rows = (await self._db.execute(
@@ -1184,7 +1276,7 @@ class ChatService:
                 await set_section(
                     session_id=session_id,
                     procedure_code=proc.code,
-                    section_type=section_type,
+                    section_type=db_section_type,
                     content=answer,
                     forms=[f.model_dump() for f in section_forms],
                 )
@@ -1195,7 +1287,7 @@ class ChatService:
                 session_id=session.id,
                 role=MessageRole.ASSISTANT,
                 content=answer,
-                section_type=section_type,
+                section_type=db_section_type,
             )
             self._db.add(assistant_msg)
             await self._db.flush()
@@ -1204,9 +1296,11 @@ class ChatService:
         elapsed_ms = int((time.monotonic() - start) * 1000)
         is_reuse = bool(message_id and not user_message_id and user is not None)
         logger.info(
-            f"Chat | section | code={proc.code} | type={section_type} "
+            f"Chat | section | code={proc.code} | type={db_section_type} "
             f"| latency={elapsed_ms}ms | forms={len(section_forms)} "
-            f"| reuse={is_reuse} | cache_hit={cache_hit}"
+            f"| reuse={is_reuse} | cache_hit={cache_hit} "
+            f"| cases={len(req_cases)} | selected={selected_case!r} "
+            f"| chooser={case_chooser}"
         )
         return SectionResponse(
             answer=answer,
@@ -1216,9 +1310,13 @@ class ChatService:
             chip_label=chip_label,
             forms=section_forms,
             procedure_code=proc.code,
-            section_type=section_type,
+            section_type=db_section_type,
             latency_ms=elapsed_ms,
             is_reuse=is_reuse,
+            # Chỉ chooser cần chips để user chọn. Khi đã chọn/auto-match thì
+            # render thẳng nội dung, không hiện chips.
+            case_groups=req_cases if case_chooser else [],
+            selected_case_group=selected_case,
         )
 
     # ── Form guide: hướng dẫn điền 1 biểu mẫu cụ thể ─────────────────────────
@@ -1451,13 +1549,41 @@ class ChatService:
         )).first()
         return row[0] if row else None
 
+    async def _get_requirement_case_groups(self, proc_id) -> list[str]:
+        """
+        Fix B: danh sách các case_group (trường hợp hồ sơ) phân biệt của 1 thủ
+        tục, theo thứ tự xuất hiện. Bỏ qua requirement không có case_group
+        (giấy tờ chung — áp dụng cho mọi trường hợp). Trả [] nếu thủ tục chỉ
+        có 1 loại hồ sơ duy nhất.
+        """
+        from app.models.procedure import ProcedureRequirement
+
+        rows = (await self._db.execute(
+            select(ProcedureRequirement.case_group).where(
+                ProcedureRequirement.procedure_id == proc_id
+            ).order_by(ProcedureRequirement.order)
+        )).scalars().all()
+        ordered: list[str] = []
+        for cg in rows:
+            cg = (cg or "").strip()
+            if cg and cg not in ordered:
+                ordered.append(cg)
+        return ordered
+
     async def _build_section_raw_data(
         self,
         section_type: str,
         proc,
         procedure_code: str,
+        case_group: str | None = None,
     ) -> str:
-        """Fetch + format raw data cho 1 section type. Trả empty str nếu rỗng."""
+        """
+        Fetch + format raw data cho 1 section type. Trả empty str nếu rỗng.
+
+        `case_group` (Fix B): nếu truyền (user đã chọn 1 trường hợp hồ sơ), chỉ
+        giữ giấy tờ của case đó + giấy tờ chung (không gắn case_group nào) áp
+        dụng cho mọi trường hợp.
+        """
         from app.models.procedure import (
             Procedure, ProcedureFee, ProcedureRequirement, ProcedureStep,
         )
@@ -1478,6 +1604,16 @@ class ChatService:
             )).scalars().all()
             if not rows:
                 return ""
+            # Fix B: lọc theo trường hợp user chọn — giữ case đó + giấy tờ
+            # chung (case_group rỗng) áp dụng cho mọi trường hợp.
+            if case_group:
+                rows = [
+                    r for r in rows
+                    if (r.case_group or "").strip() == case_group
+                    or not (r.case_group or "").strip()
+                ]
+                if not rows:
+                    return ""
             # Group by case_group
             from collections import defaultdict
             grouped: dict[str, list] = defaultdict(list)
