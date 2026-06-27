@@ -87,6 +87,24 @@ def _detect_section_intent(question: str) -> str | None:
     return None
 
 
+# Phase 11.2: section_type được phép inherit từ prev message
+# (form_guide:* quá specific cho 1 form → KHÔNG inherit)
+_INHERITABLE_SECTIONS = {"steps", "requirements", "fees", "agency", "forms"}
+
+
+def _inherit_section_from_history(history: list[dict] | None) -> str | None:
+    """Lấy section_type của assistant turn gần nhất từ history (guest path)."""
+    if not history:
+        return None
+    for turn in reversed(history):
+        if turn.get("role") == "assistant":
+            st = turn.get("section_type")
+            if st and st in _INHERITABLE_SECTIONS:
+                return st
+            return None  # assistant turn gần nhất không có section → không inherit
+    return None
+
+
 class ChatService:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
@@ -453,6 +471,14 @@ class ChatService:
             # Phase 11.1: auto-route section intent khi user hỏi natural
             # follow-up (vd "giấy tờ ủy quyền") thay vì click chip dock.
             section_intent = _detect_section_intent(payload.question)
+            # Phase 11.2: nếu user không có section keyword nhưng prev assistant
+            # turn đang ở section → coi là clarification, kế thừa section_type.
+            # Vd: hỏi "hồ sơ" → bot list → user "tôi chưa có bằng" → vẫn
+            # render requirements với case_group filter mới.
+            if not section_intent and focus:
+                section_intent = _inherit_section_from_history(
+                    [t.model_dump() for t in (payload.history or [])]
+                )
             if focus and section_intent:
                 inline = await self._try_inline_section(
                     focus_code=focus.code,
@@ -554,6 +580,10 @@ class ChatService:
         # intro answer bằng section content filtered theo user_context.
         # Mark assistant_msg.section_type để idempotent với chip click sau.
         section_intent = _detect_section_intent(payload.question)
+        # Phase 11.2: inherit section từ message assistant gần nhất nếu user
+        # đang clarify (không có section keyword nhưng prev đang ở section).
+        if not section_intent and focus:
+            section_intent = await self._inherit_section_from_db(session.id)
         if focus and section_intent:
             inline = await self._try_inline_section(
                 focus_code=focus.code,
@@ -747,10 +777,14 @@ class ChatService:
             )
             doc_chunk = chunk_result.scalar_one_or_none()
             if doc_chunk:
+                # rerank_score được gắn vào chunk.metadata bởi LLMReranker
+                # (nếu RAG_RERANK_ENABLED). None khi rerank tắt.
+                rerank_score = chunk.metadata.get("rerank_score")
                 self._db.add(RAGRetrieval(
                     query_id=rag_query.id,         # DD: query_id (was: rag_query_id)
                     chunk_id=doc_chunk.id,
                     score=chunk.score,
+                    rerank_score=rerank_score,
                     rank_order=rank,               # DD: rank_order (was: rank)
                     retrieval_method="vector",
                 ))
@@ -818,6 +852,28 @@ class ChatService:
         if not self._has_online_submission(fees):
             return None
         return self._DVCQG_SUBMIT_URL.format(fid=proc.formality_id)
+
+    async def _inherit_section_from_db(self, session_id: str) -> str | None:
+        """Phase 11.2: lấy section_type của ASSISTANT message gần nhất trong session.
+
+        Chỉ inherit các section "main" (steps/requirements/fees/agency/forms).
+        Skip form_guide:* vì quá specific (1 form cụ thể) — không hợp logic
+        clarify cho câu hỏi mới.
+        """
+        result = await self._db.execute(
+            select(Message.section_type)
+            .where(
+                Message.session_id == session_id,
+                Message.role == MessageRole.ASSISTANT,
+                Message.section_type.is_not(None),
+            )
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        st = result.scalar_one_or_none()
+        if st and st in _INHERITABLE_SECTIONS:
+            return st
+        return None
 
     def _enqueue_prefetch(
         self,

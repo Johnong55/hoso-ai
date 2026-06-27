@@ -10,6 +10,10 @@ class ConversationTurn(BaseModel):
     """1 lượt hội thoại — dùng cho guest gửi history từ localStorage để giữ multi-turn."""
     role: str = Field(..., pattern="^(user|assistant)$")
     content: str = Field(..., max_length=4000)
+    # Phase 11.2: section_type của assistant turn để BE inherit context khi
+    # user clarify (vd hỏi "hồ sơ" rồi nói "tôi chưa có bằng lái" → vẫn
+    # ở chế độ requirements với case mới). Optional cho backward compat.
+    section_type: str | None = None
 
 
 class AskRequest(BaseModel):
